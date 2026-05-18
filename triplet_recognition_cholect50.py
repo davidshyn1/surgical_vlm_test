@@ -1,13 +1,14 @@
 """
 triplet_recognition_cholect50.py
 
-CholecT50 triplet recognition (instrument, verb, target) — single-prompt evaluation.
+CholecT50 triplet recognition (instrument, verb, target).
 
-  - Prompt: instrument + verb + target in one question (bench figure style)
-  - --prompt-mode mcq: MCQ option lists (--mcq-option-format list|lettered)
-  - --prompt-mode ov:  open vocabulary (no option list)
+  --eval-protocol joint: one question, all triplets per frame (<instrument, verb, target>)
+  --eval-protocol sequential_gt: instrument → verb → target; context = GT for prior steps
+  --eval-protocol sequential_pred: same order; context = model answers for prior steps
+
+  --prompt-mode mcq | ov
   - Metrics: per-component Accuracy, Triplet Accuracy, per-component mAP
-  - Default: evaluate all triplet annotations (--eval-all)
 """
 
 from __future__ import annotations
@@ -52,6 +53,15 @@ INSTRUMENT_OPTIONS = [
 VERB_OPTIONS = list(ACTION_OPTIONS_FIXED)
 TARGET_OPTIONS = list(TARGET_OPTIONS_FIXED)
 
+EVAL_PROTOCOL_JOINT = "joint"
+EVAL_PROTOCOL_SEQUENTIAL_GT = "sequential_gt"
+EVAL_PROTOCOL_SEQUENTIAL_PRED = "sequential_pred"
+EVAL_PROTOCOLS = (
+    EVAL_PROTOCOL_JOINT,
+    EVAL_PROTOCOL_SEQUENTIAL_GT,
+    EVAL_PROTOCOL_SEQUENTIAL_PRED,
+)
+
 def _canonical(s: str | None) -> str:
     t = (s or "").strip().lower()
     t = t.replace("null-verb", "null_verb").replace("null-target", "null_target")
@@ -91,94 +101,158 @@ def _format_option_list_block(title: str, options: list[str]) -> tuple[str, dict
     return line, _build_name_option_map(options)
 
 
-def _format_lettered_block(title: str, options: list[str]) -> tuple[str, dict[str, str]]:
-    """Lettered block (A. …, B. …) plus map for letter and name matching."""
-    lines = [f"{title}:"]
-    letter_to_option: dict[str, str] = {}
-    name_map = _build_name_option_map(options)
-    for i, opt in enumerate(options):
-        letter = chr(ord("A") + i)
-        disp = cholect_display_label(opt)
-        lines.append(f"{letter}. {disp}")
-        letter_to_option[letter.upper()] = opt
-        letter_to_option[letter.lower()] = opt
-    return "\n".join(lines), {**letter_to_option, **name_map}
-
-
-def _build_output_format_instruction(*, mcq: bool) -> str:
-    """Structured triplet blocks; field names 'instrument' / 'target' / 'verb' highlighted."""
-    lines = [
-        "Answer using the following structure only. "
-        "List every instrument–verb–target triplet you see (one triplet per block). "
-        "Use these field names exactly:",
-        "",
-        "'instrument': <instrument name>",
-        "'target': <anatomical target>",
-        "'verb': <surgical verb>",
-        "",
-        "Example (single triplet):",
-        "'instrument': grasper",
-        "'target': gallbladder",
-        "'verb': grasp",
-        "",
-        "If there are multiple triplets, separate each block with a blank line. "
-        "Do not use bullet numbers or extra prose outside these lines.",
-    ]
-    if mcq:
-        lines.insert(
-            1,
-            "Each value must be chosen from the corresponding 'instrument', 'verb', or 'target' option list below.",
-        )
-    return "\n".join(lines)
+_ANGLE_TRIPLET_RE = re.compile(
+    r"<\s*([^,<]+?)\s*,\s*([^,<]+?)\s*,\s*([^>]+?)\s*>",
+    re.IGNORECASE,
+)
 
 
 def build_triplet_recognition_prompt(
     *,
     prompt_mode: str,
-    mcq_option_format: str = "list",
 ) -> tuple[str, dict[str, Any]]:
     """
     Bench-style single triplet question.
-    MCQ: instrument / verb / target option lists (--mcq-option-format).
+    MCQ: instrument / verb / target comma-separated option lists.
     OV:  no option lists.
     """
     mode = (prompt_mode or "mcq").strip().lower()
-    opt_fmt = (mcq_option_format or "list").strip().lower()
-    meta: dict[str, Any] = {"prompt_mode": mode, "mcq_option_format": opt_fmt}
+    meta: dict[str, Any] = {"prompt_mode": mode}
 
     core = (
         "What tasks are the instruments accomplishing with the targets in this surgical image? "
-        "There may be more than one 'instrument'–'verb'–'target' triplet in the frame."
+        "Answer with one triplet per line: <instrument, verb, target>"
     )
-    output_fmt = _build_output_format_instruction(mcq=(mode == "mcq"))
 
     if mode == "ov":
-        body = f"{core}\n\n{output_fmt}"
-        return body, meta
+        return core, meta
 
     if mode != "mcq":
         raise ValueError(f"Unknown --prompt-mode {prompt_mode!r}; choose mcq or ov.")
 
-    if opt_fmt not in ("list", "lettered"):
-        raise ValueError(f"Unknown --mcq-option-format {mcq_option_format!r}; choose list or lettered.")
-
-    fmt_block = _format_option_list_block if opt_fmt == "list" else _format_lettered_block
-    inst_block, inst_map = fmt_block("'instrument' options", INSTRUMENT_OPTIONS)
-    verb_block, verb_map = fmt_block("'verb' options", VERB_OPTIONS)
-    tgt_block, tgt_map = fmt_block("'target' options", TARGET_OPTIONS)
+    inst_block, inst_map = _format_option_list_block("instrument", INSTRUMENT_OPTIONS)
+    verb_block, verb_map = _format_option_list_block("verb", VERB_OPTIONS)
+    tgt_block, tgt_map = _format_option_list_block("target", TARGET_OPTIONS)
     meta["option_maps"] = {
         "instrument": inst_map,
         "verb": verb_map,
         "target": tgt_map,
     }
 
-    body = (
-        f"{core}\n\n"
-        f"{output_fmt}\n\n"
-        "The available 'instrument', 'verb', and 'target' options are:\n\n"
-        f"{inst_block}\n\n{verb_block}\n\n{tgt_block}"
-    )
+    body = f"{core}\n\n{inst_block}\n{verb_block}\n{tgt_block}"
     return body, meta
+
+
+def build_mcq_option_meta() -> dict[str, Any]:
+    inst_block, inst_map = _format_option_list_block("instrument", INSTRUMENT_OPTIONS)
+    verb_block, verb_map = _format_option_list_block("verb", VERB_OPTIONS)
+    tgt_block, tgt_map = _format_option_list_block("target", TARGET_OPTIONS)
+    return {
+        "prompt_mode": "mcq",
+        "option_maps": {
+            "instrument": inst_map,
+            "verb": verb_map,
+            "target": tgt_map,
+        },
+        "option_blocks": {
+            "instrument": inst_block,
+            "verb": verb_block,
+            "target": tgt_block,
+        },
+    }
+
+
+def build_prompt_meta(*, prompt_mode: str) -> dict[str, Any]:
+    mode = (prompt_mode or "mcq").strip().lower()
+    if mode == "ov":
+        return {"prompt_mode": mode}
+    if mode != "mcq":
+        raise ValueError(f"Unknown --prompt-mode {prompt_mode!r}; choose mcq or ov.")
+    return build_mcq_option_meta()
+
+
+def build_component_prompt(
+    component: str,
+    *,
+    prompt_mode: str,
+    prompt_meta: dict[str, Any],
+    context_instrument: str | None = None,
+    context_verb: str | None = None,
+) -> str:
+    """Single-step prompt for instrument, verb, or target (sequential protocols)."""
+    comp = (component or "").strip().lower()
+    if comp not in ("instrument", "verb", "target"):
+        raise ValueError(f"Unknown component {component!r}")
+
+    if comp == "instrument":
+        lead = "What is the instrument in this surgical image?"
+    elif comp == "verb":
+        inst_disp = cholect_display_label(context_instrument or "")
+        lead = (
+            f"In this surgical image, the instrument is {inst_disp}.\n"
+            "What is the verb (surgical action)?"
+        )
+    else:
+        inst_disp = cholect_display_label(context_instrument or "")
+        verb_disp = cholect_display_label(context_verb or "")
+        lead = (
+            f"In this surgical image, the instrument is {inst_disp} and the verb is {verb_disp}.\n"
+            "What is the target?"
+        )
+
+    answer_line = f"Answer with the {comp} name only."
+    mode = (prompt_mode or "mcq").strip().lower()
+    if mode == "ov":
+        return f"{lead}\n{answer_line}"
+
+    blocks = prompt_meta.get("option_blocks") or {}
+    opt_line = blocks.get(comp, "")
+    if opt_line:
+        return f"{lead}\n{answer_line}\n\n{opt_line}"
+    return f"{lead}\n{answer_line}"
+
+
+def parse_component_response(
+    text: str,
+    component: str,
+    *,
+    prompt_mode: str,
+    prompt_meta: dict[str, Any] | None = None,
+) -> str | None:
+    """Parse a single instrument, verb, or target from model text."""
+    comp = (component or "").strip().lower()
+    meta = prompt_meta or {}
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    options = {
+        "instrument": INSTRUMENT_OPTIONS,
+        "verb": VERB_OPTIONS,
+        "target": TARGET_OPTIONS,
+    }.get(comp, [])
+    if not options:
+        return None
+
+    mode = (prompt_mode or "mcq").strip().lower()
+    candidates = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if not candidates:
+        candidates = [raw]
+
+    if mode == "mcq":
+        maps = (meta.get("option_maps") or {}).get(comp) or {}
+        for cand in candidates:
+            hit = _match_option_token(cand, maps, options)
+            if hit:
+                return hit
+        return _match_option_token(raw, maps, options)
+
+    for cand in candidates:
+        hits = parse_mcq_terms(cand, options)
+        if hits:
+            return hits[0]
+    hits = parse_mcq_terms(raw, options)
+    return hits[0] if hits else None
 
 
 def wrap_vlm_prompt(body: str) -> str:
@@ -394,13 +468,46 @@ def _parse_one_triplet_tokens(
     }
 
 
+def _parse_angle_bracket_triplets(
+    raw: str,
+    *,
+    prompt_mode: str,
+    prompt_meta: dict[str, Any],
+) -> list[dict[str, str | None]]:
+    """Parse <instrument, verb, target> (one or more per line / inline)."""
+    triplets: list[dict[str, str | None]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for m in _ANGLE_TRIPLET_RE.finditer(raw or ""):
+        t = _parse_one_triplet_tokens(
+            m.group(1).strip().strip("'\""),
+            m.group(2).strip().strip("'\""),
+            m.group(3).strip().strip("'\""),
+            prompt_mode=prompt_mode,
+            prompt_meta=prompt_meta,
+        )
+        if not (t.get("instrument") and t.get("verb") and t.get("target")):
+            continue
+        key = (_canonical(t["instrument"]), _canonical(t["verb"]), _canonical(t["target"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        triplets.append(t)
+    return triplets
+
+
 def _parse_triplet_lines_from_text(
     raw: str,
     *,
     prompt_mode: str,
     prompt_meta: dict[str, Any],
 ) -> list[dict[str, str | None]]:
-    """Parse zero or more triplets from structured or free-form response."""
+    """Parse zero or more triplets from <inst, verb, tgt> or legacy formats."""
+    bracketed = _parse_angle_bracket_triplets(
+        raw, prompt_mode=prompt_mode, prompt_meta=prompt_meta,
+    )
+    if bracketed:
+        return bracketed
+
     labeled = _parse_labeled_triplet_blocks(raw, prompt_mode=prompt_mode, prompt_meta=prompt_meta)
     if labeled:
         return labeled
@@ -473,6 +580,28 @@ def parse_triplet_response(
         out["verb"] = triplets[0]["verb"]
         out["target"] = triplets[0]["target"]
     return out
+
+
+def _parsed_from_components(
+    instrument: str | None,
+    verb: str | None,
+    target: str | None,
+) -> dict[str, Any]:
+    triplet = {
+        "instrument": instrument,
+        "verb": verb,
+        "target": target,
+    }
+    if instrument and verb and target:
+        triplets = [triplet]
+    else:
+        triplets = []
+    return {
+        "triplets": triplets,
+        "instrument": instrument,
+        "verb": verb,
+        "target": target,
+    }
 
 
 def _average_precision(y_true: list[int], y_score: list[float]) -> float:
@@ -613,8 +742,15 @@ def aggregate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
     verb_pred = _pred_component_sets("verb")
     tgt_pred = _pred_component_sets("target")
 
+    protocols = {
+        (r.get("input") or {}).get("eval_protocol")
+        for r in results
+        if (r.get("input") or {}).get("eval_protocol")
+    }
+    protocol_label = next(iter(protocols)) if len(protocols) == 1 else "cholect50_triplet_recognition"
+
     return {
-        "protocol": "cholect50_triplet_recognition",
+        "protocol": protocol_label,
         "instrument_accuracy": acc_block("instrument_correct"),
         "verb_accuracy": acc_block("verb_correct"),
         "target_accuracy": acc_block("target_correct"),
@@ -674,6 +810,28 @@ def _should_skip_resume(rec: dict, tool: str) -> bool:
     return bool(p.get("triplets"))
 
 
+def _generate_vlm_text(
+    *,
+    backend,
+    pil_side: int,
+    image_path: Path,
+    user_prompt: str,
+    args: argparse.Namespace,
+) -> str:
+    image = Image.open(image_path).convert("RGB")
+    image = image.resize((pil_side, pil_side), resample=Image.Resampling.BICUBIC)
+    gen_kw: dict[str, Any] = {"do_sample": args.do_sample, "min_length": 1}
+    if args.do_sample:
+        gen_kw["temperature"] = args.temperature
+    pb = backend.get_prompt_builder()
+    pb.add_turn(role="human", message=wrap_vlm_prompt(user_prompt))
+    return backend.generate(
+        image,
+        pb.get_prompt(),
+        **{**gen_kw, "max_new_tokens": args.max_new_tokens},
+    )
+
+
 def _run_vlm_on_frame(
     *,
     backend,
@@ -683,39 +841,112 @@ def _run_vlm_on_frame(
     prompt_meta: dict[str, Any],
     args: argparse.Namespace,
 ) -> dict[str, Any]:
-    """Single VLM forward pass on one frame (shared across annotations on that frame)."""
+    """Single VLM forward pass on one frame (joint protocol; shared across annotations)."""
     try:
-        image = Image.open(image_path).convert("RGB")
-        image = image.resize((pil_side, pil_side), resample=Image.Resampling.BICUBIC)
-
-        gen_kw: dict[str, Any] = {"do_sample": args.do_sample, "min_length": 1}
-        if args.do_sample:
-            gen_kw["temperature"] = args.temperature
-
-        pb = backend.get_prompt_builder()
-        pb.add_turn(role="human", message=wrap_vlm_prompt(user_prompt))
-        text = backend.generate(
-            image,
-            pb.get_prompt(),
-            **{**gen_kw, "max_new_tokens": args.max_new_tokens},
+        text = _generate_vlm_text(
+            backend=backend,
+            pil_side=pil_side,
+            image_path=image_path,
+            user_prompt=user_prompt,
+            args=args,
         )
-
         triplet = parse_triplet_response(
             text,
             prompt_mode=args.prompt_mode,
             prompt_meta=prompt_meta,
         )
-
         return {"text": text, "parsed": triplet}
     except Exception as e:
         print(f"SKIP {image_path}: {e}", file=sys.stderr)
         return {"error": str(e)}
 
 
+def _run_sequential_triplet(
+    *,
+    backend,
+    pil_side: int,
+    image_path: Path,
+    sample: dict[str, Any],
+    prompt_meta: dict[str, Any],
+    args: argparse.Namespace,
+    use_gt_context: bool,
+) -> dict[str, Any]:
+    """Three VLM calls: instrument → verb → target (per annotation)."""
+    try:
+        parsed_ann = sample["parsed"]
+        gt_inst = str(parsed_ann.get("instrument_name") or "")
+        gt_verb = str(parsed_ann.get("verb_name") or "")
+        gt_tgt = str(parsed_ann.get("target_name") or "")
+
+        steps: list[dict[str, Any]] = []
+        pred_inst: str | None = None
+        pred_verb: str | None = None
+        pred_tgt: str | None = None
+
+        p_inst = build_component_prompt(
+            "instrument", prompt_mode=args.prompt_mode, prompt_meta=prompt_meta,
+        )
+        t_inst = _generate_vlm_text(
+            backend=backend, pil_side=pil_side, image_path=image_path,
+            user_prompt=p_inst, args=args,
+        )
+        pred_inst = parse_component_response(
+            t_inst, "instrument", prompt_mode=args.prompt_mode, prompt_meta=prompt_meta,
+        )
+        steps.append({"step": "instrument", "prompt": p_inst, "text": t_inst, "parsed": pred_inst})
+
+        ctx_inst = gt_inst if use_gt_context else (pred_inst or "")
+        p_verb = build_component_prompt(
+            "verb",
+            prompt_mode=args.prompt_mode,
+            prompt_meta=prompt_meta,
+            context_instrument=ctx_inst,
+        )
+        t_verb = _generate_vlm_text(
+            backend=backend, pil_side=pil_side, image_path=image_path,
+            user_prompt=p_verb, args=args,
+        )
+        pred_verb = parse_component_response(
+            t_verb, "verb", prompt_mode=args.prompt_mode, prompt_meta=prompt_meta,
+        )
+        steps.append({"step": "verb", "prompt": p_verb, "text": t_verb, "parsed": pred_verb})
+
+        ctx_verb = gt_verb if use_gt_context else (pred_verb or "")
+        p_tgt = build_component_prompt(
+            "target",
+            prompt_mode=args.prompt_mode,
+            prompt_meta=prompt_meta,
+            context_instrument=ctx_inst,
+            context_verb=ctx_verb,
+        )
+        t_tgt = _generate_vlm_text(
+            backend=backend, pil_side=pil_side, image_path=image_path,
+            user_prompt=p_tgt, args=args,
+        )
+        pred_tgt = parse_component_response(
+            t_tgt, "target", prompt_mode=args.prompt_mode, prompt_meta=prompt_meta,
+        )
+        steps.append({"step": "target", "prompt": p_tgt, "text": t_tgt, "parsed": pred_tgt})
+
+        parsed = _parsed_from_components(pred_inst, pred_verb, pred_tgt)
+        combined_text = "\n---\n".join(
+            f"[{s['step']}]\n{s['text']}" for s in steps
+        )
+        return {
+            "text": combined_text,
+            "parsed": parsed,
+            "sequential_steps": steps,
+            "context_mode": "gt" if use_gt_context else "predicted",
+        }
+    except Exception as e:
+        print(f"SKIP {image_path} sequential: {e}", file=sys.stderr)
+        return {"error": str(e)}
+
+
 def _make_result_entry(
     *,
     sample: dict[str, Any],
-    user_prompt: str,
+    user_prompt: str | dict[str, str],
     args: argparse.Namespace,
     frame_output: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -726,9 +957,8 @@ def _make_result_entry(
             "image_path": path_str,
             "tool": tool,
             "label_context": label_context,
-            "eval_protocol": "cholect50_triplet_recognition",
+            "eval_protocol": args.eval_protocol,
             "prompt_mode": args.prompt_mode,
-            "mcq_option_format": args.mcq_option_format if args.prompt_mode == "mcq" else None,
             "user_prompt": user_prompt,
         },
         "output": None,
@@ -738,10 +968,14 @@ def _make_result_entry(
     if frame_output.get("error"):
         entry["error"] = frame_output["error"]
         return entry
-    entry["output"] = {
+    out: dict[str, Any] = {
         "text": frame_output.get("text"),
         "parsed": frame_output.get("parsed"),
     }
+    if frame_output.get("sequential_steps") is not None:
+        out["sequential_steps"] = frame_output["sequential_steps"]
+        out["context_mode"] = frame_output.get("context_mode")
+    entry["output"] = out
     return entry
 
 
@@ -756,16 +990,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--video", type=str, default=None)
     p.add_argument("--instrument", type=str, default=None)
     p.add_argument(
+        "--eval-protocol",
+        choices=EVAL_PROTOCOLS,
+        default=EVAL_PROTOCOL_JOINT,
+        help=(
+            "joint: one prompt, all triplets per frame; "
+            "sequential_gt: instrument→verb→target with GT context; "
+            "sequential_pred: same with predicted context."
+        ),
+    )
+    p.add_argument(
         "--prompt-mode",
         choices=("mcq", "ov"),
         default="mcq",
         help="mcq: option lists in prompt; ov: open vocabulary (no options).",
-    )
-    p.add_argument(
-        "--mcq-option-format",
-        choices=("list", "lettered"),
-        default="list",
-        help="With --prompt-mode mcq: list=comma-separated labels only; lettered=A. B. C. prefixes.",
     )
     p.add_argument(
         "--samples-per-instrument",
@@ -816,16 +1054,24 @@ def main() -> None:
             "프레임 이미지 루트를 찾지 못했습니다. --videos-root 또는 CHOLECT50_VIDEOS_ROOT 를 지정해 주세요."
         )
 
-    user_prompt, prompt_meta = build_triplet_recognition_prompt(
-        prompt_mode=args.prompt_mode,
-        mcq_option_format=args.mcq_option_format,
-    )
+    prompt_meta = build_prompt_meta(prompt_mode=args.prompt_mode)
+    if args.eval_protocol == EVAL_PROTOCOL_JOINT:
+        user_prompt, joint_meta = build_triplet_recognition_prompt(
+            prompt_mode=args.prompt_mode,
+        )
+        prompt_meta = joint_meta
+    else:
+        user_prompt = {
+            "instrument": build_component_prompt(
+                "instrument", prompt_mode=args.prompt_mode, prompt_meta=prompt_meta,
+            ),
+            "verb": "(context-dependent)",
+            "target": "(context-dependent)",
+        }
 
     model_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", (args.model_name or "original").strip() or "original")
     out_root = args.output_root.resolve()
-    mode_slug = args.prompt_mode
-    if args.prompt_mode == "mcq":
-        mode_slug = f"{mode_slug}_{args.mcq_option_format}"
+    mode_slug = f"{args.prompt_mode}_{args.eval_protocol}"
     out_path = (
         args.output.resolve()
         if args.output is not None
@@ -860,8 +1106,11 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    fmt_note = f", mcq_option_format={args.mcq_option_format}" if args.prompt_mode == "mcq" else ""
-    print(f"CholecT50 triplet recognition: prompt_mode={args.prompt_mode}{fmt_note}.", file=sys.stderr)
+    print(
+        f"CholecT50 triplet recognition: prompt_mode={args.prompt_mode}, "
+        f"eval_protocol={args.eval_protocol}.",
+        file=sys.stderr,
+    )
 
     model_id = args.model_id or _DEFAULT_MODEL_IDS[args.backend]
     hf_token = args.hf_token.resolve().read_text(encoding="utf-8").strip()
@@ -881,12 +1130,16 @@ def main() -> None:
     results, key_to_idx = load_results_for_resume(out_path)
     vlm_calls = 0
 
-    def _upsert_scored_entry(sample: dict[str, Any], frame_output: dict[str, Any] | None) -> None:
+    def _upsert_scored_entry(
+        sample: dict[str, Any],
+        frame_output: dict[str, Any] | None,
+        *,
+        prompt_field: str | dict[str, str],
+    ) -> None:
         row_key = _row_key(sample)
-        _, tool = row_key
         entry = _make_result_entry(
             sample=sample,
-            user_prompt=user_prompt,
+            user_prompt=prompt_field,
             args=args,
             frame_output=frame_output,
         )
@@ -895,48 +1148,77 @@ def main() -> None:
             entry["evaluation"] = ev
         upsert_result(results, key_to_idx, row_key, entry)
 
-    by_frame = _group_samples_by_frame(sampled)
-    n_frames = len(by_frame)
-    print(
-        f"Frame-level inference: {n_frames} unique frame(s), "
-        f"{len(sampled)} annotation(s), one model load.",
-        file=sys.stderr,
-    )
-    for path_str in sorted(by_frame.keys()):
-        frame_items = by_frame[path_str]
-        all_done = True
-        if not args.force:
+    use_gt_context = args.eval_protocol == EVAL_PROTOCOL_SEQUENTIAL_GT
+
+    if args.eval_protocol == EVAL_PROTOCOL_JOINT:
+        by_frame = _group_samples_by_frame(sampled)
+        n_frames = len(by_frame)
+        print(
+            f"Frame-level inference: {n_frames} unique frame(s), "
+            f"{len(sampled)} annotation(s), one model load.",
+            file=sys.stderr,
+        )
+        for path_str in sorted(by_frame.keys()):
+            frame_items = by_frame[path_str]
+            all_done = True
+            if not args.force:
+                for s in frame_items:
+                    _, tool = _row_key(s)
+                    rk = (path_str, tool)
+                    if rk not in key_to_idx or not _should_skip_resume(results[key_to_idx[rk]], tool):
+                        all_done = False
+                        break
+            if all_done:
+                for s in frame_items:
+                    _, tool = _row_key(s)
+                    rec = results[key_to_idx[(path_str, tool)]]
+                    inp = rec.setdefault("input", {})
+                    inp["label_context"] = _label_context_from_parsed(s["parsed"])
+                    ev = _score_record(rec)
+                    if ev:
+                        rec["evaluation"] = ev
+                continue
+
+            frame_output = None if args.force else _find_cached_frame_output(results, path_str)
+            if frame_output is None:
+                frame_output = _run_vlm_on_frame(
+                    backend=backend,
+                    pil_side=pil_side,
+                    image_path=Path(path_str),
+                    user_prompt=str(user_prompt),
+                    prompt_meta=prompt_meta,
+                    args=args,
+                )
+                vlm_calls += 1
+
             for s in frame_items:
                 _, tool = _row_key(s)
-                rk = (path_str, tool)
-                if rk not in key_to_idx or not _should_skip_resume(results[key_to_idx[rk]], tool):
-                    all_done = False
-                    break
-        if all_done:
-            for s in frame_items:
-                _, tool = _row_key(s)
-                rec = results[key_to_idx[(path_str, tool)]]
-                inp = rec.setdefault("input", {})
-                inp["label_context"] = _label_context_from_parsed(s["parsed"])
-                ev = _score_record(rec)
-                if ev:
-                    rec["evaluation"] = ev
-            continue
-
-        frame_output = None if args.force else _find_cached_frame_output(results, path_str)
-        if frame_output is None:
-            frame_output = _run_vlm_on_frame(
-                backend=backend,
-                pil_side=pil_side,
-                image_path=Path(path_str),
-                user_prompt=user_prompt,
-                prompt_meta=prompt_meta,
-                args=args,
-            )
-            vlm_calls += 1
-
-        for s in frame_items:
-            _, tool = _row_key(s)
+                if (
+                    not args.force
+                    and (path_str, tool) in key_to_idx
+                    and _should_skip_resume(results[key_to_idx[(path_str, tool)]], tool)
+                ):
+                    rec = results[key_to_idx[(path_str, tool)]]
+                    inp = rec.setdefault("input", {})
+                    inp["label_context"] = _label_context_from_parsed(s["parsed"])
+                    if frame_output and not frame_output.get("error"):
+                        rec["output"] = {
+                            "text": frame_output.get("text"),
+                            "parsed": frame_output.get("parsed"),
+                        }
+                    ev = _score_record(rec)
+                    if ev:
+                        rec["evaluation"] = ev
+                    continue
+                _upsert_scored_entry(s, frame_output, prompt_field=str(user_prompt))
+    else:
+        print(
+            f"Sequential inference: {len(sampled)} annotation(s), "
+            f"3 VLM calls each, context={'GT' if use_gt_context else 'predicted'}.",
+            file=sys.stderr,
+        )
+        for sample in sampled:
+            path_str, tool = _row_key(sample)
             if (
                 not args.force
                 and (path_str, tool) in key_to_idx
@@ -944,17 +1226,29 @@ def main() -> None:
             ):
                 rec = results[key_to_idx[(path_str, tool)]]
                 inp = rec.setdefault("input", {})
-                inp["label_context"] = _label_context_from_parsed(s["parsed"])
-                if frame_output and not frame_output.get("error"):
-                    rec["output"] = {
-                        "text": frame_output.get("text"),
-                        "parsed": frame_output.get("parsed"),
-                    }
+                inp["label_context"] = _label_context_from_parsed(sample["parsed"])
                 ev = _score_record(rec)
                 if ev:
                     rec["evaluation"] = ev
                 continue
-            _upsert_scored_entry(s, frame_output)
+
+            frame_output = _run_sequential_triplet(
+                backend=backend,
+                pil_side=pil_side,
+                image_path=Path(path_str),
+                sample=sample,
+                prompt_meta=prompt_meta,
+                args=args,
+                use_gt_context=use_gt_context,
+            )
+            if not frame_output.get("error"):
+                vlm_calls += len(frame_output.get("sequential_steps") or [])
+            step_prompts = {
+                s["step"]: s["prompt"]
+                for s in (frame_output.get("sequential_steps") or [])
+                if isinstance(s, dict) and s.get("step")
+            }
+            _upsert_scored_entry(sample, frame_output, prompt_field=step_prompts)
 
     print(f"VLM forward passes this run: {vlm_calls}", file=sys.stderr)
 
@@ -967,7 +1261,7 @@ def main() -> None:
     metrics = aggregate_metrics(results)
     payload = {
         "task": "triplet_recognition",
-        "eval_protocol": "cholect50_triplet_recognition",
+        "eval_protocol": args.eval_protocol,
         "dataset": "cholect50-challenge-val",
         "dataset_root": str(args.dataset_root),
         "video_roots": [str(p) for p in video_roots],
@@ -977,8 +1271,12 @@ def main() -> None:
         "model_name": model_name,
         "vlm_load": meta,
         "prompt_mode": args.prompt_mode,
-        "mcq_option_format": args.mcq_option_format if args.prompt_mode == "mcq" else None,
         "user_prompt_template": user_prompt,
+        "sequential_context": (
+            "gt" if args.eval_protocol == EVAL_PROTOCOL_SEQUENTIAL_GT
+            else "predicted" if args.eval_protocol == EVAL_PROTOCOL_SEQUENTIAL_PRED
+            else None
+        ),
         "eval_all": bool(args.eval_all),
         "samples_only": bool(args.samples_only),
         "vlm_forward_passes": vlm_calls,

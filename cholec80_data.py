@@ -61,6 +61,15 @@ CANONICAL_TO_DISPLAY: dict[str, str] = dict(
     zip(PHASE_CANONICAL_IDS, PHASE_DISPLAY_NAMES, strict=True)
 )
 
+# Cholec80 videos are 25 fps; phase_annotations are per video frame (25 fps).
+# Tool annotations use every 25th frame (indices 0, 25, 50, …).
+# Default eval frame set: 0.1 fps → stride 250 (0, 250, 500, …).
+CHOLEC80_VIDEO_FPS = 25
+CHOLEC80_EVAL_FPS = 0.1
+CHOLEC80_EVAL_FRAME_STRIDE = int(round(CHOLEC80_VIDEO_FPS / CHOLEC80_EVAL_FPS))
+CHOLEC80_EVAL_FRAMES_DIRNAME = "frames_0p1fps"
+CHOLEC80_EVAL_PHASE_FILENAME_SUFFIX = "-phase.txt"
+
 _IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 
 
@@ -116,6 +125,131 @@ def video_in_split(vid_num: int, split: str) -> bool:
     if sp in ("all", "full"):
         return 1 <= vid_num <= 80
     raise ValueError(f"Unknown split {split!r}; use eval, train, or all.")
+
+
+def default_eval_frames_root(dataset_root: Path) -> Path:
+    return (dataset_root / CHOLEC80_EVAL_FRAMES_DIRNAME).resolve()
+
+
+def phase_annotation_filename(vid_num: int) -> str:
+    return f"{video_stem(vid_num)}{CHOLEC80_EVAL_PHASE_FILENAME_SUFFIX}"
+
+
+def infer_native_phase_frame_stride(phase_file: Path, *, sample_rows: int = 64) -> int | None:
+    """
+    Estimate spacing between annotated frames (Cholec80 native phase ≈ 1).
+    Returns None if inconclusive.
+    """
+    indices: list[int] = []
+    with phase_file.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        if reader.fieldnames is None:
+            return None
+        frame_key = reader.fieldnames[0]
+        for row in reader:
+            try:
+                indices.append(int(row[frame_key]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if len(indices) >= sample_rows:
+                break
+    if len(indices) < 2:
+        return None
+    diffs = [b - a for a, b in zip(indices, indices[1:]) if b > a]
+    if not diffs:
+        return None
+    return min(diffs)
+
+
+def write_subsampled_phase_annotation(
+    native_phase_file: Path,
+    output_phase_file: Path,
+    *,
+    frame_stride: int = CHOLEC80_EVAL_FRAME_STRIDE,
+) -> int:
+    """
+    Subsample 25 fps phase annotations to eval rate (default 0.1 fps: 0, 250, 500, …).
+    Writes a tab-separated file with the same header as the native annotations.
+    Returns the number of rows written (excluding header).
+    """
+    stride = max(1, int(frame_stride))
+    output_phase_file.parent.mkdir(parents=True, exist_ok=True)
+    n_written = 0
+    with native_phase_file.open("r", encoding="utf-8", newline="") as fin:
+        reader = csv.DictReader(fin, delimiter="\t")
+        if reader.fieldnames is None:
+            raise ValueError(f"Invalid phase file (no header): {native_phase_file}")
+        frame_key = reader.fieldnames[0]
+        phase_key = reader.fieldnames[1]
+        with output_phase_file.open("w", encoding="utf-8", newline="") as fout:
+            writer = csv.DictWriter(
+                fout,
+                fieldnames=[frame_key, phase_key],
+                delimiter="\t",
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            for row in reader:
+                try:
+                    fi = int(row[frame_key])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if fi % stride != 0:
+                    continue
+                writer.writerow({frame_key: fi, phase_key: row.get(phase_key, "")})
+                n_written += 1
+    return n_written
+
+
+def build_subsampled_phase_annotations_for_split(
+    dataset_root: Path,
+    frames_root: Path,
+    *,
+    split: str = "eval",
+    video_filter: int | None = None,
+    frame_stride: int = CHOLEC80_EVAL_FRAME_STRIDE,
+    overwrite: bool = False,
+) -> list[tuple[int, Path, int]]:
+    """Write videoNN/videoNN-phase.txt under frames_root for each video in split."""
+    written: list[tuple[int, Path, int]] = []
+    for vid_num, native_path in list_phase_annotation_files(
+        dataset_root,
+        split=split,
+        video_filter=video_filter,
+    ):
+        stem = video_stem(vid_num)
+        out_path = frames_root / stem / phase_annotation_filename(vid_num)
+        if out_path.is_file() and not overwrite:
+            with out_path.open("r", encoding="utf-8") as f:
+                n_existing = max(0, sum(1 for _ in f) - 1)
+            written.append((vid_num, out_path.resolve(), n_existing))
+            continue
+        n = write_subsampled_phase_annotation(
+            native_path,
+            out_path,
+            frame_stride=frame_stride,
+        )
+        written.append((vid_num, out_path.resolve(), n))
+    return written
+
+
+def resolve_phase_annotation_for_eval(
+    dataset_root: Path,
+    vid_num: int,
+    frames_root: Path | None,
+) -> tuple[Path, int]:
+    """
+    Pick phase annotation file and loader stride.
+    Prefer frames_root/videoNN/videoNN-phase.txt (eval manifest, stride=1).
+    Otherwise native phase_annotations at 25 fps (stride=CHOLEC80_EVAL_FRAME_STRIDE).
+    """
+    stem = video_stem(vid_num)
+    native = (dataset_root / "phase_annotations" / phase_annotation_filename(vid_num)).resolve()
+    if frames_root is not None:
+        local = (frames_root / stem / phase_annotation_filename(vid_num)).resolve()
+        if local.is_file():
+            return local, 1
+    return native, CHOLEC80_EVAL_FRAME_STRIDE
 
 
 def load_phase_annotation_rows(
@@ -202,18 +336,26 @@ def collect_phase_samples(
     *,
     split: str = "eval",
     video_filter: int | None = None,
-    frame_stride: int = 1,
+    frame_stride: int | None = None,
     max_frames_per_video: int | None = None,
     frames_root: Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Build evaluation items: one row per (video, frame_index)."""
+    """Build evaluation items: one row per (video, frame_index) at eval fps by default."""
     video_dir = dataset_root / "videos"
     items: list[dict[str, Any]] = []
-    for vid_num, phase_path in list_phase_annotation_files(
+    for vid_num, _native_phase_path in list_phase_annotation_files(
         dataset_root,
         split=split,
         video_filter=video_filter,
     ):
+        phase_path, ann_stride = resolve_phase_annotation_for_eval(
+            dataset_root,
+            vid_num,
+            frames_root,
+        )
+        load_stride = ann_stride
+        if frame_stride is not None:
+            load_stride = max(1, int(frame_stride))
         stem = video_stem(vid_num)
         video_path = video_dir / f"{stem}.mp4"
         if not video_path.is_file():
@@ -224,7 +366,7 @@ def collect_phase_samples(
             continue
         for fi, phase_id in load_phase_annotation_rows(
             phase_path,
-            frame_stride=frame_stride,
+            frame_stride=load_stride,
             max_frames=max_frames_per_video,
         ):
             img_path = None
@@ -239,6 +381,7 @@ def collect_phase_samples(
                     "phase_display": CANONICAL_TO_DISPLAY.get(phase_id, phase_id),
                     "video_path": video_path.resolve(),
                     "phase_annotation": phase_path.resolve(),
+                    "phase_manifest_eval": ann_stride == 1,
                     "img_path": img_path,
                 }
             )

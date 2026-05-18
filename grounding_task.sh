@@ -20,7 +20,7 @@ export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 : "${CHOLECT50_CHALLENGE_VAL_ROOT:=$ROOT/../eval/cholect50-challenge-val}"
 : "${CHOLECT50_VIDEOS_ROOT:=}"
 : "${CHOLEC80_ROOT:=$ROOT/../data/Cholec80}"
-: "${CHOLEC80_FRAMES_ROOT:=$ROOT/../eval/cholec80_frames_stride25}"
+: "${CHOLEC80_FRAMES_ROOT:=$CHOLEC80_ROOT/frames_0p1fps}"
 
 guess_conda_python() {
   local env_name="$1"
@@ -135,7 +135,7 @@ Usage:
 
 Example (Cholec80 phase recognition, eval videos 41–80):
   BACKEND=prismatic DEVICE_VISIBLE=0 \\
-    bash grounding_task.sh phase_recognition_cholec80 --frame-stride 25 --video 41
+    bash grounding_task.sh phase_recognition_cholec80 --video 41
 
 Example (full eval, one model load, one VLM call per frame — default):
   CHOLECT50_VIDEOS_ROOT=/path/to/CholecT50/videos \
@@ -152,7 +152,7 @@ Env:
   CHOLECT50_CHALLENGE_VAL_ROOT  default: ../eval/cholect50-challenge-val
   CHOLECT50_VIDEOS_ROOT         frame images (required if not under dataset-root/videos)
   CHOLEC80_ROOT                 default: ../data/Cholec80 (falls back to ../data/cholec80)
-  CHOLEC80_FRAMES_ROOT          pre-extracted frames (--frames-root); optional
+  CHOLEC80_FRAMES_ROOT          0.1 fps frames + phase manifests (default: $CHOLEC80_ROOT/frames_0p1fps)
   DEVICE_VISIBLE                -> CUDA_VISIBLE_DEVICES (default 0)
   MODEL_ID                      default --model-id when omitted
   GROUNDING_TASK_AUTO_BACKEND_SETUP=0  skip auto uv install

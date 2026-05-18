@@ -23,6 +23,8 @@ from PIL import Image
 
 from backends import load_backend
 from cholec80_data import (
+    CHOLEC80_EVAL_FPS,
+    CHOLEC80_EVAL_FRAME_STRIDE,
     CANONICAL_TO_DISPLAY,
     PHASE_CANONICAL_IDS,
     PHASE_DISPLAY_NAMES,
@@ -324,8 +326,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--frame-stride",
         type=int,
-        default=25,
-        help="Use every N-th annotated frame (default 25 ≈ 1 fps at 25 fps video).",
+        default=None,
+        help=(
+            f"Subsample annotated frames (native 25 fps phase uses default "
+            f"stride {CHOLEC80_EVAL_FRAME_STRIDE} ≈ {CHOLEC80_EVAL_FPS} fps). "
+            "With --frames-root and videoNN/videoNN-phase.txt manifests, stride=1."
+        ),
     )
     p.add_argument(
         "--max-frames-per-video",
@@ -385,11 +391,15 @@ def main() -> None:
     if frames_root is not None and not frames_root.is_dir():
         raise FileNotFoundError(f"--frames-root not found: {frames_root}")
 
+    frame_stride_arg = (
+        max(1, int(args.frame_stride)) if args.frame_stride is not None else None
+    )
+
     samples = collect_phase_samples(
         dataset_root,
         split=args.split,
         video_filter=video_filter,
-        frame_stride=max(1, int(args.frame_stride)),
+        frame_stride=frame_stride_arg,
         max_frames_per_video=args.max_frames_per_video,
         frames_root=frames_root,
     )
@@ -401,13 +411,22 @@ def main() -> None:
                         (args.model_name or "original").strip() or "original")
     out_root = args.output_root.resolve()
     split_slug = args.split
+    stride_label = (
+        str(frame_stride_arg)
+        if frame_stride_arg is not None
+        else (
+            "0p1fps_manifest"
+            if samples and samples[0].get("phase_manifest_eval")
+            else str(CHOLEC80_EVAL_FRAME_STRIDE)
+        )
+    )
     out_path = (
         args.output.resolve()
         if args.output is not None
         else (
             out_root
             / f"phase_{args.backend}_{model_name}_{split_slug}"
-            / f"cholec80_phase_stride{max(1, args.frame_stride)}.json"
+            / f"cholec80_phase_{stride_label}.json"
         ).resolve()
     )
 
@@ -420,7 +439,7 @@ def main() -> None:
     print(
         f"Cholec80 phase recognition: split={args.split}, "
         f"videos={len({s['vid_num'] for s in samples})}, "
-        f"frames={len(samples)}, stride={args.frame_stride}, {reader_note}.",
+        f"frames={len(samples)}, stride={stride_label}, {reader_note}.",
         file=sys.stderr,
     )
 
@@ -519,7 +538,9 @@ def main() -> None:
         "dataset_root": str(dataset_root),
         "split": args.split,
         "eval_video_range": "41-80" if args.split == "eval" else ("1-40" if args.split == "train" else "1-80"),
-        "frame_stride": max(1, int(args.frame_stride)),
+        "frame_stride": stride_label,
+        "cholec80_eval_fps": CHOLEC80_EVAL_FPS,
+        "cholec80_video_fps": 25,
         "frames_root": str(frames_root) if frames_root else None,
         "frame_reader": args.frame_reader,
         "backend": args.backend,
