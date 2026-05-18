@@ -1,12 +1,13 @@
 """
 instrument_localization_endovis17.py
 
-EndoVis-17-VQLA instrument localization (bounding-box output).
+EndoVis 2017 val instrument localization (mask-derived bbox GT).
 
-  - Prompt: "Where is the {instrument} located? ... Format: [x_min, y_min, x_max, y_max]"
-  - VLM input and visualizations use the same square resize (backend pil_side, e.g. 384x384)
-  - Output: normalized [0,1] bbox (GT also stored/compared in normalized xyxy)
-  - Metrics: mIoU, mAP@50, mAP@75, COCO AP (IoU 0.5:0.05:0.95)
+  - Data: ../eval/endovis2017 val*/image + label masks (512x512)
+  - GT: tight bbox per instrument class from semantic mask
+  - Prompt: normalized [x_min, y_min, x_max, y_max] in [0, 1]
+  - VLM input and visualizations: same square resize (pil_side, e.g. 384x384)
+  - Metrics: mIoU, mAP@50, mAP@75, COCO AP
 """
 
 from __future__ import annotations
@@ -21,17 +22,22 @@ from typing import Any
 import torch
 from PIL import Image
 
-from backends import load_backend
+from backend_registry import (
+    BACKEND_CHOICES,
+    bbox_parse_mode,
+    resolve_model_id,
+    resolve_output_model_name,
+)
+from backends import build_vlm_user_prompt, load_backend
 from cholect50_data import infer_pil_side
 from endovis17_data import (
-    DEFAULT_ANNOTATIONS_ROOT,
     DEFAULT_DATASET_ROOT,
-    DEFAULT_FRAMES_ROOT,
-    ENDOVIS17_IMAGE_HEIGHT,
-    ENDOVIS17_IMAGE_WIDTH,
+    ENDOVIS2017_IMAGE_SIZE,
     build_instrument_localization_prompt,
     collect_localization_samples,
+    export_bbox_annotations,
     instrument_display_name,
+    list_val_splits,
     sample_localization_items,
 )
 from utils import (
@@ -51,13 +57,6 @@ _REPO_ROOT = _SCRIPT_ROOT.parent
 DEFAULT_OUTPUT_ROOT = _SCRIPT_ROOT / "outputs" / "instrument_localization_endovis17"
 _DEFAULT_HF_TOKEN = _SCRIPT_ROOT / ".hf_token"
 
-_DEFAULT_MODEL_IDS = {
-    "prismatic": "prism-dinosiglip+7b",
-    "cosmos": "nvidia/Cosmos-Reason2-2B",
-    "groot": "nvidia/GR00T-H",
-}
-
-
 def resize_image_for_vlm(image: Image.Image, pil_side: int) -> Image.Image:
     """Square resize — same tensor geometry as VLM inference and viz overlays."""
     side = max(1, int(pil_side))
@@ -67,10 +66,10 @@ def resize_image_for_vlm(image: Image.Image, pil_side: int) -> Image.Image:
     )
 
 
-def _viz_slug(frame_stem: str, instrument_id: str, region_id: str) -> str:
+def _viz_slug(val_split: str, frame_stem: str, instrument_id: str) -> str:
+    split = re.sub(r"[^\w.-]+", "_", val_split.strip().lower())
     inst = re.sub(r"[^\w.-]+", "_", instrument_id.strip().lower())
-    reg = re.sub(r"[^\w.-]+", "_", region_id.strip().lower())
-    return f"{frame_stem}_{inst}_{reg}"
+    return f"{split}_{frame_stem}_{inst}"
 
 
 def _norm_bbox_from_field(bbox: Any) -> tuple[float, float, float, float] | None:
@@ -107,9 +106,9 @@ def save_localization_visualizations(
     pred = _norm_bbox_from_field(parsed.get("bbox_xyxy_norm"))
 
     frame_stem = str(lc.get("frame_stem") or inp.get("frame_stem") or "frame")
+    val_split = str(lc.get("val_split") or inp.get("val_split") or "")
     instrument_id = str(lc.get("label_instrument_id") or "")
-    region_id = str(lc.get("label_region_id") or "")
-    slug = _viz_slug(frame_stem, instrument_id, region_id)
+    slug = _viz_slug(val_split, frame_stem, instrument_id)
 
     ev = entry.get("evaluation") or {}
     iou_v = ev.get("iou")
@@ -179,8 +178,8 @@ def _attach_visualization_paths(entry: dict[str, Any], paths: dict[str, str | No
 
 def _row_key(sample: dict[str, Any]) -> tuple[str, str]:
     tool = (
-        f"endovis17-loc|{sample['frame_stem']}|"
-        f"{sample['instrument_id']}|{sample['region_id']}"
+        f"endovis2017-loc|{sample['val_split']}|"
+        f"{sample['frame_stem']}|{sample['instrument_id']}"
     )
     return str(sample["img_path"]), tool
 
@@ -204,7 +203,7 @@ def _should_skip_resume(rec: dict, tool: str) -> bool:
 def parse_localization_response(
     text: str,
     *,
-    backend: str,
+    bbox_parse_mode: str,
     image_width: int,
     image_height: int,
 ) -> dict[str, Any]:
@@ -214,7 +213,7 @@ def parse_localization_response(
 
     bbox_norm = parse_bbox_from_model_text(
         raw,
-        backend=backend,
+        bbox_parse_mode=bbox_parse_mode,
         image_width=image_width,
         image_height=image_height,
     )
@@ -302,7 +301,7 @@ def aggregate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
     det = compute_detection_map_metrics(det_records)
     n_scored = len(det_records)
     return {
-        "protocol": "endovis17_instrument_localization",
+        "protocol": "endovis2017_instrument_localization",
         "n_results": len(results),
         "n_scored": n_scored,
         "n_parsed_bbox": parsed_ok,
@@ -325,6 +324,7 @@ def _run_vlm_on_sample(
     user_prompt: str,
     sample: dict[str, Any],
     args: argparse.Namespace,
+    bbox_parse: str,
 ) -> dict[str, Any]:
     try:
         _ = pil_side  # caller must pass image already resized to (pil_side, pil_side)
@@ -333,16 +333,15 @@ def _run_vlm_on_sample(
         if args.do_sample:
             gen_kw["temperature"] = args.temperature
 
-        pb = backend.get_prompt_builder()
-        pb.add_turn(role="human", message=user_prompt.strip())
+        prompt_text = build_vlm_user_prompt(backend, user_prompt)
         text = backend.generate(
             image,
-            pb.get_prompt(),
+            prompt_text,
             **{**gen_kw, "max_new_tokens": args.max_new_tokens},
         )
         parsed = parse_localization_response(
             text,
-            backend=args.backend,
+            bbox_parse_mode=bbox_parse,
             image_width=int(sample["image_width"]),
             image_height=int(sample["image_height"]),
         )
@@ -365,16 +364,18 @@ def _make_result_entry(
             "tool": tool,
             "frame_stem": sample["frame_stem"],
             "label_context": {
+                "val_split": sample["val_split"],
                 "frame_stem": sample["frame_stem"],
                 "label_instrument_id": sample["instrument_id"],
                 "label_instrument_display": sample["instrument_display"],
-                "label_region_id": sample["region_id"],
-                "label_region_display": sample["region_display"],
+                "mask_class_id": sample["mask_class_id"],
+                "label_mask_path": str(sample.get("label_mask_path", "")),
                 "label_bbox_xyxy_px": sample["bbox_xyxy_px"],
                 "label_bbox_xyxy_norm": sample["bbox_xyxy_norm"],
-                "dataset_question": sample.get("dataset_question"),
+                "mask_pixel_count": sample.get("mask_pixel_count"),
             },
-            "eval_protocol": "endovis17_instrument_localization",
+            "val_split": sample["val_split"],
+            "eval_protocol": "endovis2017_instrument_localization",
             "user_prompt": user_prompt,
             "image_width": sample["image_width"],
             "image_height": sample["image_height"],
@@ -395,26 +396,41 @@ def _make_result_entry(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="EndoVis-17-VQLA instrument localization (bbox output).",
+        description="EndoVis 2017 val instrument localization (mask-derived bbox GT).",
     )
-    p.add_argument("--backend", choices=("prismatic", "cosmos", "groot"), default="prismatic")
+    p.add_argument("--backend", choices=BACKEND_CHOICES, default="prismatic")
     p.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
-    p.add_argument("--frames-root", type=Path, default=DEFAULT_FRAMES_ROOT)
-    p.add_argument("--annotations-root", type=Path, default=DEFAULT_ANNOTATIONS_ROOT)
-    p.add_argument("--instrument", type=str, default=None, help="Filter by instrument id.")
-    p.add_argument("--region", type=str, default=None, help="Filter by region id (e.g. left-top).")
-    p.add_argument("--frame", type=str, default=None, help="Single frame stem, e.g. seq1_frame015.")
+    p.add_argument(
+        "--val-split",
+        action="append",
+        default=None,
+        help="Val folder name (repeatable), e.g. val1. Default: all val*.",
+    )
+    p.add_argument("--instrument", type=str, default=None, help="Filter by instrument id slug.")
+    p.add_argument("--frame", type=str, default=None, help="Single frame stem, e.g. seq_1_frame225.")
+    p.add_argument("--min-mask-pixels", type=int, default=1, help="Min mask pixels for GT bbox.")
+    p.add_argument(
+        "--export-annotations",
+        type=Path,
+        default=None,
+        help="Optional path to write mask-derived bbox JSON and exit (no VLM).",
+    )
     p.add_argument(
         "--max-samples",
         type=int,
         default=None,
-        help="Random subsample cap (debug). Omit for full 236 localization queries.",
+        help="Random subsample cap (debug). Omit for full val set.",
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     p.add_argument("--output", type=Path, default=None)
     p.add_argument("--model-id", type=str, default=None)
-    p.add_argument("--model-name", type=str, default="original")
+    p.add_argument(
+        "--model-name",
+        type=str,
+        default=None,
+        help="Output folder slug (default: size alias, e.g. cosmos-reason2-2b, qwen3-vl-32b).",
+    )
     p.add_argument("--vlm-checkpoint", type=Path, default=None)
     p.add_argument("--vlm-config", type=Path, default=None)
     p.add_argument("--hf-token", type=Path, default=_DEFAULT_HF_TOKEN)
@@ -446,28 +462,39 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     dataset_root = args.dataset_root.resolve()
-    frames_root = (args.frames_root or (dataset_root / "left_frames")).resolve()
-    ann_root = (args.annotations_root or (dataset_root / "vqla")).resolve()
+    val_splits = args.val_split or list_val_splits(dataset_root)
 
     samples = collect_localization_samples(
-        annotations_root=ann_root,
-        frames_root=frames_root,
+        dataset_root=dataset_root,
+        val_splits=val_splits,
         instrument_filter=args.instrument,
-        region_filter=args.region,
         frame_stem_filter=args.frame,
+        min_mask_pixels=args.min_mask_pixels,
     )
     if not samples:
         raise RuntimeError(
-            f"No localization samples under {ann_root}. Check paths and filters."
+            f"No localization samples under {dataset_root} ({val_splits}). "
+            "Check val*/image and val*/label."
         )
+
+    if args.export_annotations is not None:
+        export_bbox_annotations(
+            samples,
+            args.export_annotations.resolve(),
+            dataset_root=dataset_root,
+        )
+        print(
+            f"Exported {len(samples)} mask-derived bbox samples to {args.export_annotations}",
+            file=sys.stderr,
+        )
+        return
 
     samples = sample_localization_items(
         samples, cap=args.max_samples, seed=args.seed,
     )
 
-    model_name = re.sub(
-        r"[^a-zA-Z0-9._-]+", "_", (args.model_name or "original").strip() or "original",
-    )
+    model_id = resolve_model_id(args.backend, args.model_id)
+    model_name = resolve_output_model_name(args.backend, model_id, args.model_name)
     out_root = args.output_root.resolve()
     out_path = (
         args.output.resolve()
@@ -475,7 +502,7 @@ def main() -> None:
         else (
             out_root
             / f"loc_{args.backend}_{model_name}"
-            / "endovis17_instrument_localization.json"
+            / "endovis2017_instrument_localization.json"
         ).resolve()
     )
     viz_root = out_path.parent / "visualizations"
@@ -530,13 +557,13 @@ def main() -> None:
         return
 
     print(
-        f"EndoVis-17 localization: samples={len(samples)}, "
+        f"EndoVis 2017 localization: samples={len(samples)}, "
         f"frames={len({s['frame_stem'] for s in samples})}, "
-        f"image={ENDOVIS17_IMAGE_WIDTH}x{ENDOVIS17_IMAGE_HEIGHT}.",
+        f"splits={sorted({s['val_split'] for s in samples})}, "
+        f"image={ENDOVIS2017_IMAGE_SIZE}x{ENDOVIS2017_IMAGE_SIZE} (native BMP).",
         file=sys.stderr,
     )
 
-    model_id = args.model_id or _DEFAULT_MODEL_IDS[args.backend]
     hf_token = args.hf_token.resolve().read_text(encoding="utf-8").strip()
     device = resolve_device(args.device)
 
@@ -548,6 +575,7 @@ def main() -> None:
         vlm_config=args.vlm_config,
         device=device,
     )
+    bbox_parse = bbox_parse_mode(args.backend, meta)
     backend.to(device, dtype=torch.bfloat16)
     pil_side = (
         _resolve_pil_side()
@@ -558,7 +586,7 @@ def main() -> None:
 
     results, key_to_idx = load_results_for_resume(out_path)
     vlm_calls = 0
-    prompt_cache: dict[tuple[str, str], str] = {}
+    prompt_cache: dict[str, str] = {}
 
     def _upsert_scored(
         sample: dict[str, Any],
@@ -566,13 +594,12 @@ def main() -> None:
         *,
         vlm_image: Image.Image | None = None,
     ) -> dict[str, Any]:
-        pk = (sample["instrument_id"], sample["region_id"])
-        if pk not in prompt_cache:
-            prompt_cache[pk] = build_instrument_localization_prompt(
-                instrument_id=sample["instrument_id"],
-                region_id=sample["region_id"],
+        inst = sample["instrument_id"]
+        if inst not in prompt_cache:
+            prompt_cache[inst] = build_instrument_localization_prompt(
+                instrument_id=inst,
             )
-        user_prompt = prompt_cache[pk]
+        user_prompt = prompt_cache[inst]
         row_key = _row_key(sample)
         entry = _make_result_entry(
             sample=sample,
@@ -630,20 +657,20 @@ def main() -> None:
             _upsert_scored(sample, {"error": str(e)})
             continue
 
-        pk = (sample["instrument_id"], sample["region_id"])
-        if pk not in prompt_cache:
-            prompt_cache[pk] = build_instrument_localization_prompt(
-                instrument_id=sample["instrument_id"],
-                region_id=sample["region_id"],
+        inst = sample["instrument_id"]
+        if inst not in prompt_cache:
+            prompt_cache[inst] = build_instrument_localization_prompt(
+                instrument_id=inst,
             )
 
         frame_output = _run_vlm_on_sample(
             backend=backend,
             pil_side=pil_side,
             image=vlm_image,
-            user_prompt=prompt_cache[pk],
+            user_prompt=prompt_cache[inst],
             sample=sample,
             args=args,
+            bbox_parse=bbox_parse,
         )
         vlm_calls += 1
         _upsert_scored(sample, frame_output, vlm_image=vlm_image)
@@ -662,16 +689,15 @@ def main() -> None:
     metrics = aggregate_metrics(results)
     example_prompt = build_instrument_localization_prompt(
         instrument_id="large_needle_driver",
-        region_id="left-bottom",
     )
     payload = {
         "task": "instrument_localization",
-        "eval_protocol": "endovis17_instrument_localization",
-        "dataset": "EndoVis-17-VQLA",
+        "eval_protocol": "endovis2017_instrument_localization",
+        "dataset": "endovis2017",
         "dataset_root": str(dataset_root),
-        "frames_root": str(frames_root),
-        "annotations_root": str(ann_root),
-        "image_size": [ENDOVIS17_IMAGE_WIDTH, ENDOVIS17_IMAGE_HEIGHT],
+        "val_splits": sorted({s["val_split"] for s in samples}),
+        "gt_source": "mask label -> tight bbox per instrument class",
+        "native_image_size": [ENDOVIS2017_IMAGE_SIZE, ENDOVIS2017_IMAGE_SIZE],
         "vlm_input_side": pil_side,
         "visualization_image_size": [pil_side, pil_side],
         "backend": args.backend,
@@ -690,9 +716,10 @@ def main() -> None:
         "vlm_forward_passes": vlm_calls,
         "visualization_root": str(viz_root.resolve()) if args.viz else None,
         "visualization_layout": {
-            "gt": "visualizations/gt/{frame}_{instrument}_{region}_gt.jpg",
-            "pred": "visualizations/pred/{frame}_{instrument}_{region}_pred.jpg",
-            "comparison": "visualizations/comparison/{frame}_{instrument}_{region}_gt_pred.jpg",
+            "note": "Overlays on VLM square resize (pil_side), normalized bbox coords.",
+            "gt": "visualizations/gt/{split}_{frame}_{instrument}_gt.jpg",
+            "pred": "visualizations/pred/{split}_{frame}_{instrument}_pred.jpg",
+            "comparison": "visualizations/comparison/{split}_{frame}_{instrument}_gt_pred.jpg",
         },
         "metrics": metrics,
         "count": len(results),

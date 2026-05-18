@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# SurgVLM-style eval runner (triplet recognition).
-# Backend .venv: bash setup_backend.sh [prismatic|cosmos|groot|all]
+# SurgVLM-style eval runner (triplet / phase / localization).
+# Prismatic: bash setup_backend.sh prismatic  (../backend/prismatic-vlms)
+# HF models (Qwen, InternVL, PaliGemma, Cosmos, GR00T, …): transformers env via HF_PYTHON
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,21 +9,20 @@ cd "$ROOT"
 
 BACKEND_ROOT_DEFAULT="$(cd "$ROOT/../backend" && pwd)"
 VLA_ROOT="${VLA_ROOT_OVERRIDE:-$BACKEND_ROOT_DEFAULT}"
+# Hub snapshots: <surgical>/.cache/huggingface/hub
 HF_CACHE_ROOT="${HF_CACHE_ROOT:-$ROOT/../.cache/huggingface}"
 export HF_HOME="${HF_HOME:-$HF_CACHE_ROOT}"
-export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_CACHE_ROOT/hub}"
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HUB_CACHE}"
-export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_CACHE_ROOT/transformers}"
 
 : "${GVL_PRISMATIC_DEFAULT:=$VLA_ROOT/prismatic-vlms/.venv/bin/python}"
-: "${GVL_COSMOS_DEFAULT:=$VLA_ROOT/cosmos-reason2/.venv/bin/python}"
-: "${GVL_GROOT_DEFAULT:=$VLA_ROOT/GR00T-H/.venv/bin/python}"
 : "${CHOLECT50_CHALLENGE_VAL_ROOT:=$ROOT/../eval/cholect50-challenge-val}"
 : "${CHOLECT50_VIDEOS_ROOT:=}"
 : "${CHOLEC80_ROOT:=$ROOT/../data/Cholec80}"
 : "${CHOLEC80_EVAL_ROOT:=$ROOT/../eval/cholec80}"
 : "${CHOLEC80_FRAMES_ROOT:=$CHOLEC80_EVAL_ROOT/frames_0p1fps}"
-: "${ENDOVIS17_VQLA_ROOT:=$ROOT/../eval/EndoVis-17-VQLA}"
+: "${ENDOVIS2017_ROOT:=$ROOT/../eval/endovis2017}"
 
 guess_conda_python() {
   local env_name="$1"
@@ -40,11 +40,13 @@ guess_conda_python() {
   return 1
 }
 
+is_prismatic_backend() {
+  [[ "${1,,}" == "prismatic" ]]
+}
+
 backend_repo_dir() {
   case "$1" in
     prismatic) echo "$VLA_ROOT/prismatic-vlms" ;;
-    cosmos) echo "$VLA_ROOT/cosmos-reason2" ;;
-    groot) echo "$VLA_ROOT/GR00T-H" ;;
     *) echo "" ;;
   esac
 }
@@ -64,57 +66,44 @@ append_unique_pythonpath() {
 
 ensure_repo_uv_venv_if_needed() {
   local backend="$1"
+  is_prismatic_backend "$backend" || return 0
   case "${GROUNDING_TASK_AUTO_BACKEND_SETUP:-1}" in
     0|false|no|off) return 0 ;;
   esac
   local repo setup
   repo="$(backend_repo_dir "$backend")"
   [[ -z "$repo" || ! -d "$repo" ]] && return 0
-  case "$backend" in
-    prismatic) [[ -n "${PRISMATIC_PYTHON:-}" ]] && return 0 ;;
-    cosmos) [[ -n "${COSMOS_PYTHON:-}" ]] && return 0 ;;
-    groot) [[ -n "${GROOT_PYTHON:-}" ]] && return 0 ;;
-  esac
+  [[ -n "${PRISMATIC_PYTHON:-}" ]] && return 0
   [[ -x "$repo/.venv/bin/python" ]] && return 0
   setup="$ROOT/setup_backend_uv_env.sh"
   if [[ ! -f "$setup" ]]; then
-    echo "ERROR: missing $repo/.venv — run: bash $ROOT/setup_backend.sh $backend" >&2
+    echo "ERROR: missing $repo/.venv — run: bash $ROOT/setup_backend.sh prismatic" >&2
     exit 2
   fi
-  echo "[INFO] No .venv at $repo — running: bash $setup $backend" >&2
-  bash "$setup" "$backend"
+  echo "[INFO] No .venv at $repo — running: bash $setup prismatic" >&2
+  bash "$setup" prismatic
 }
 
 resolve_backend_python() {
   local backend="$1" py="" repo
-  repo="$(backend_repo_dir "$backend")"
-  case "$backend" in
-    prismatic)
-      py="${PRISMATIC_PYTHON:-}"
-      [[ -z "$py" && -n "$repo" && -x "$repo/.venv/bin/python" ]] && py="$repo/.venv/bin/python"
-      [[ -z "$py" && -x "$ROOT/.venv-prismatic/bin/python" ]] && py="$ROOT/.venv-prismatic/bin/python"
-      [[ -z "$py" ]] && py="$(guess_conda_python prismatic || true)"
-      [[ -z "$py" && -x "$GVL_PRISMATIC_DEFAULT" ]] && py="$GVL_PRISMATIC_DEFAULT"
-      ;;
-    cosmos)
-      py="${COSMOS_PYTHON:-}"
-      [[ -z "$py" && -n "$repo" && -x "$repo/.venv/bin/python" ]] && py="$repo/.venv/bin/python"
-      [[ -z "$py" && -x "$ROOT/.venv-cosmos/bin/python" ]] && py="$ROOT/.venv-cosmos/bin/python"
-      [[ -z "$py" && -x "$GVL_COSMOS_DEFAULT" ]] && py="$GVL_COSMOS_DEFAULT"
-      ;;
-    groot)
-      py="${GROOT_PYTHON:-}"
-      [[ -z "$py" && -n "$repo" && -x "$repo/.venv/bin/python" ]] && py="$repo/.venv/bin/python"
-      [[ -z "$py" && -x "$ROOT/.venv-groot/bin/python" ]] && py="$ROOT/.venv-groot/bin/python"
-      [[ -z "$py" && -x "$GVL_GROOT_DEFAULT" ]] && py="$GVL_GROOT_DEFAULT"
-      ;;
-    *)
-      echo "ERROR: unsupported backend '$backend'" >&2
-      exit 2
-      ;;
-  esac
+  if is_prismatic_backend "$backend"; then
+    repo="$(backend_repo_dir prismatic)"
+    py="${PRISMATIC_PYTHON:-}"
+    [[ -z "$py" && -n "$repo" && -x "$repo/.venv/bin/python" ]] && py="$repo/.venv/bin/python"
+    [[ -z "$py" && -x "$ROOT/.venv-prismatic/bin/python" ]] && py="$ROOT/.venv-prismatic/bin/python"
+    [[ -z "$py" ]] && py="$(guess_conda_python prismatic || true)"
+    [[ -z "$py" && -x "$GVL_PRISMATIC_DEFAULT" ]] && py="$GVL_PRISMATIC_DEFAULT"
+  else
+    py="${HF_PYTHON:-}"
+    [[ -z "$py" && -x "$ROOT/.venv-hf/bin/python" ]] && py="$ROOT/.venv-hf/bin/python"
+    [[ -z "$py" ]] && py="$(guess_conda_python appgen || true)"
+    [[ -z "$py" ]] && py="$(guess_conda_python surgical_vlm || true)"
+    [[ -z "$py" && -x "$(command -v python3)" ]] && py="$(command -v python3)"
+  fi
   if [[ -z "$py" || ! -x "$py" ]]; then
     echo "ERROR: Python not found for backend '$backend'" >&2
+    echo "  prismatic: set PRISMATIC_PYTHON or run setup_backend.sh prismatic" >&2
+    echo "  hf/qwen3/internvl/…: set HF_PYTHON to a transformers-capable interpreter" >&2
     exit 2
   fi
   echo "$py"
@@ -136,43 +125,31 @@ Usage:
   BACKEND=<backend> bash grounding_task.sh phase_recognition_cholec80 [args...]
   BACKEND=<backend> bash grounding_task.sh instrument_localization_endovis17 [args...]
 
-Example (EndoVis-17 instrument localization, full 236 queries):
+Backends:
+  prismatic     TRI-ML prismatic-vlms (local backend package / checkpoint)
+  hf            transformers AutoProcessor (set MODEL_ID or --model-id)
+  qwen3-4b, qwen3-32b, cosmos-2b, cosmos-32b  size-specific (see backend_registry.py)
+  internvl3.5, paligemma2, groot              other families
+
+Examples:
   BACKEND=prismatic DEVICE_VISIBLE=0 \\
     bash grounding_task.sh instrument_localization_endovis17 --max-samples 5
 
-Example (Cholec80 phase recognition, eval videos 41–80):
-  BACKEND=prismatic DEVICE_VISIBLE=0 \\
+  BACKEND=qwen3-4b HF_PYTHON=/path/to/python \\
+    bash grounding_task.sh instrument_localization_endovis17 --max-samples 5
+
+  BACKEND=qwen3-32b DEVICE_VISIBLE=0 \\
+    bash grounding_task.sh triplet_recognition_cholect50 --eval-protocol joint --max-samples 3
+
+  BACKEND=cosmos-32b HF_PYTHON=/path/to/python \\
     bash grounding_task.sh phase_recognition_cholec80 --video 41
 
-Example (full eval, one model load, one VLM call per frame — default):
-  CHOLECT50_VIDEOS_ROOT=/path/to/CholecT50/videos \
-    BACKEND=prismatic DEVICE_VISIBLE=0 \
-    bash grounding_task.sh triplet_recognition_cholect50 --prompt-mode mcq
-
-  Do not loop per instrument in shell; omit --instrument to evaluate all annotations
-  in a single process (same frame is inferred once, scored per GT triplet).
-
-  # Open vocabulary (no option list), subsampled:
-  bash grounding_task.sh triplet_recognition_cholect50 --prompt-mode ov --samples-only --video VID68
-
 Env:
-  CHOLECT50_CHALLENGE_VAL_ROOT  default: ../eval/cholect50-challenge-val
-  CHOLECT50_VIDEOS_ROOT         frame images (required if not under dataset-root/videos)
-  CHOLEC80_ROOT                 default: ../data/Cholec80 (falls back to ../data/cholec80)
-  CHOLEC80_EVAL_ROOT            eval frame dataset root (default: ../eval/cholec80)
-  CHOLEC80_FRAMES_ROOT          0.1 fps PNGs + phase txt (default: $CHOLEC80_EVAL_ROOT/frames_0p1fps)
-  ENDOVIS17_VQLA_ROOT           default: ../eval/EndoVis-17-VQLA
-  DEVICE_VISIBLE                -> CUDA_VISIBLE_DEVICES (default 0)
+  HF_PYTHON                     Python for non-prismatic backends (transformers)
+  PRISMATIC_PYTHON              Python for prismatic backend
   MODEL_ID                      default --model-id when omitted
-  GROUNDING_TASK_AUTO_BACKEND_SETUP=0  skip auto uv install
-
-Setup (first time):
-  bash setup_backend.sh prismatic
-  cp /path/to/.hf_token $ROOT/.hf_token   # or set --hf-token
-
-Paths (defaults):
-  eval labels: $ROOT/../eval/cholect50-challenge-val
-  HF cache:    $ROOT/../.cache/huggingface
+  MODEL_NAME                    default --model-name (output folder slug) when omitted
+  GROUNDING_TASK_AUTO_BACKEND_SETUP=0  skip auto uv install (prismatic only)
 EOF
 }
 
@@ -218,6 +195,7 @@ repo="$(backend_repo_dir "$backend")"
 
 set -- "$@" --backend "$backend"
 [[ -n "${MODEL_ID:-}" ]] && ! has_flag "--model-id" "$@" && set -- "$@" --model-id "$MODEL_ID"
+[[ -n "${MODEL_NAME:-}" ]] && ! has_flag "--model-name" "$@" && set -- "$@" --model-name "$MODEL_NAME"
 
 : "${DEVICE_VISIBLE:=0}"
 export CUDA_VISIBLE_DEVICES="$DEVICE_VISIBLE"
@@ -234,9 +212,7 @@ if [[ "$task" == "phase_recognition_cholec80" ]]; then
 fi
 
 if [[ "$task" == "instrument_localization_endovis17" ]]; then
-  ! has_flag "--dataset-root" "$@" && set -- "$@" --dataset-root "$ENDOVIS17_VQLA_ROOT"
-  ! has_flag "--frames-root" "$@" && set -- "$@" --frames-root "$ENDOVIS17_VQLA_ROOT/left_frames"
-  ! has_flag "--annotations-root" "$@" && set -- "$@" --annotations-root "$ENDOVIS17_VQLA_ROOT/vqla"
+  ! has_flag "--dataset-root" "$@" && set -- "$@" --dataset-root "$ENDOVIS2017_ROOT"
 fi
 
 exec uv run --python "$python_bin" "$script" "$@"

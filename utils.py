@@ -232,11 +232,15 @@ def parse_qwen1000_bbox_to_normalized(text: str) -> tuple[float, float, float, f
 def parse_bbox_from_model_text(
     text: str,
     *,
-    backend: str,
+    backend: str = "",
+    bbox_parse_mode: str | None = None,
     image_width: int | None = None,
     image_height: int | None = None,
 ) -> tuple[float, float, float, float] | None:
-    if backend == "cosmos":
+    mode = bbox_parse_mode
+    if mode is None:
+        mode = "cosmos" if backend == "cosmos" else "prismatic"
+    if mode == "cosmos":
         return parse_qwen1000_bbox_to_normalized(text)
     raw = parse_raw_bbox_xyxy(text)
     if raw is None:

@@ -24,10 +24,10 @@ from typing import Any
 import torch
 from PIL import Image
 
-from backends import load_backend
+from backend_registry import BACKEND_CHOICES, resolve_model_id, resolve_output_model_name
+from backends import build_vlm_user_prompt, load_backend
 from cholect50_data import (
     CHALLENGE_VAL_ROOT,
-    _DEFAULT_MODEL_IDS,
     collect_instrument_annotations,
     discover_video_roots,
     infer_pil_side,
@@ -823,11 +823,12 @@ def _generate_vlm_text(
     gen_kw: dict[str, Any] = {"do_sample": args.do_sample, "min_length": 1}
     if args.do_sample:
         gen_kw["temperature"] = args.temperature
-    pb = backend.get_prompt_builder()
-    pb.add_turn(role="human", message=wrap_vlm_prompt(user_prompt))
+    prompt_text = build_vlm_user_prompt(
+        backend, user_prompt, wrap=wrap_vlm_prompt,
+    )
     return backend.generate(
         image,
-        pb.get_prompt(),
+        prompt_text,
         **{**gen_kw, "max_new_tokens": args.max_new_tokens},
     )
 
@@ -983,7 +984,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="CholecT50 triplet recognition (single-prompt, component + triplet metrics).",
     )
-    p.add_argument("--backend", choices=("prismatic", "cosmos", "groot"), default="prismatic")
+    p.add_argument("--backend", choices=BACKEND_CHOICES, default="prismatic")
     p.add_argument("--dataset-root", type=Path, default=CHALLENGE_VAL_ROOT)
     p.add_argument("--videos-root", type=Path, default=None)
     p.add_argument("--cholect-root-fallback", type=Path, default=CHOLECT_ROOT)
@@ -1026,7 +1027,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     p.add_argument("--output", type=Path, default=None)
     p.add_argument("--model-id", type=str, default=None)
-    p.add_argument("--model-name", type=str, default="original")
+    p.add_argument(
+        "--model-name",
+        type=str,
+        default=None,
+        help="Output folder slug (default: size alias, e.g. qwen3-vl-32b).",
+    )
     p.add_argument("--vlm-checkpoint", type=Path, default=None)
     p.add_argument("--vlm-config", type=Path, default=None)
     p.add_argument("--hf-token", type=Path, default=_DEFAULT_HF_TOKEN)
@@ -1069,7 +1075,8 @@ def main() -> None:
             "target": "(context-dependent)",
         }
 
-    model_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", (args.model_name or "original").strip() or "original")
+    model_id = resolve_model_id(args.backend, args.model_id)
+    model_name = resolve_output_model_name(args.backend, model_id, args.model_name)
     out_root = args.output_root.resolve()
     mode_slug = f"{args.prompt_mode}_{args.eval_protocol}"
     out_path = (
@@ -1112,7 +1119,6 @@ def main() -> None:
         file=sys.stderr,
     )
 
-    model_id = args.model_id or _DEFAULT_MODEL_IDS[args.backend]
     hf_token = args.hf_token.resolve().read_text(encoding="utf-8").strip()
     device = resolve_device(args.device)
 

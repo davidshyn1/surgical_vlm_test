@@ -21,7 +21,8 @@ from typing import Any
 import torch
 from PIL import Image
 
-from backends import load_backend
+from backend_registry import BACKEND_CHOICES, resolve_model_id, resolve_output_model_name
+from backends import build_vlm_user_prompt, load_backend
 from cholec80_data import (
     CHOLEC80_EVAL_FPS,
     CHOLEC80_EVAL_FRAME_STRIDE,
@@ -32,7 +33,6 @@ from cholec80_data import (
     package_eval_frames_root,
     PHASE_CANONICAL_IDS,
     PHASE_DISPLAY_NAMES,
-    _DEFAULT_MODEL_IDS,
     collect_phase_samples,
     ffmpeg_available,
     iter_samples_by_video,
@@ -265,11 +265,12 @@ def _run_vlm_on_frame(
         if args.do_sample:
             gen_kw["temperature"] = args.temperature
 
-        pb = backend.get_prompt_builder()
-        pb.add_turn(role="human", message=wrap_vlm_prompt(user_prompt))
+        prompt_text = build_vlm_user_prompt(
+            backend, user_prompt, wrap=wrap_vlm_prompt,
+        )
         text = backend.generate(
             image,
-            pb.get_prompt(),
+            prompt_text,
             **{**gen_kw, "max_new_tokens": args.max_new_tokens},
         )
         parsed = parse_phase_response(text, option_map=option_map)
@@ -318,8 +319,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Cholec80 phase recognition (eval videos 41–80 by default).",
     )
-    p.add_argument("--backend", choices=("prismatic",
-                   "cosmos", "groot"), default="prismatic")
+    p.add_argument("--backend", choices=BACKEND_CHOICES, default="prismatic")
     p.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     p.add_argument(
         "--split",
@@ -364,7 +364,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     p.add_argument("--output", type=Path, default=None)
     p.add_argument("--model-id", type=str, default=None)
-    p.add_argument("--model-name", type=str, default="original")
+    p.add_argument(
+        "--model-name",
+        type=str,
+        default=None,
+        help="Output folder slug (default: size alias, e.g. cosmos-reason2-32b).",
+    )
     p.add_argument("--vlm-checkpoint", type=Path, default=None)
     p.add_argument("--vlm-config", type=Path, default=None)
     p.add_argument("--hf-token", type=Path, default=_DEFAULT_HF_TOKEN)
@@ -427,8 +432,8 @@ def main() -> None:
             f"{frames_root}. Re-run scripts/extract_cholec80_frames.sh."
         )
 
-    model_name = re.sub(r"[^a-zA-Z0-9._-]+", "_",
-                        (args.model_name or "original").strip() or "original")
+    model_id = resolve_model_id(args.backend, args.model_id)
+    model_name = resolve_output_model_name(args.backend, model_id, args.model_name)
     out_root = args.output_root.resolve()
     split_slug = args.split
     stride_label = (
@@ -463,7 +468,6 @@ def main() -> None:
         file=sys.stderr,
     )
 
-    model_id = args.model_id or _DEFAULT_MODEL_IDS[args.backend]
     hf_token = args.hf_token.resolve().read_text(encoding="utf-8").strip()
     device = resolve_device(args.device)
 

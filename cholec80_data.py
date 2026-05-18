@@ -18,11 +18,7 @@ if TYPE_CHECKING:
 _PKG_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = _PKG_ROOT.parent
 
-_DEFAULT_MODEL_IDS = {
-    "prismatic": "prism-dinosiglip+7b",
-    "cosmos": "nvidia/Cosmos-Reason2-2B",
-    "groot": "nvidia/GR00T-H",
-}
+from backend_registry import BACKEND_CHOICES, DEFAULT_MODEL_IDS as _DEFAULT_MODEL_IDS
 
 # Canonical phase ids (7 classes, Cholec80 / EndoNet).
 PHASE_CANONICAL_IDS = [
