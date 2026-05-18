@@ -4,7 +4,7 @@ instrument_localization_endovis17.py
 EndoVis-17-VQLA instrument localization (bounding-box output).
 
   - Prompt: "Where is the {instrument} located? ... Format: [x_min, y_min, x_max, y_max]"
-  - Input image is resized to backend pil_side (e.g. 384x384) before VLM inference
+  - VLM input and visualizations use the same square resize (backend pil_side, e.g. 384x384)
   - Output: normalized [0,1] bbox (GT also stored/compared in normalized xyxy)
   - Metrics: mIoU, mAP@50, mAP@75, COCO AP (IoU 0.5:0.05:0.95)
 """
@@ -56,6 +56,15 @@ _DEFAULT_MODEL_IDS = {
     "cosmos": "nvidia/Cosmos-Reason2-2B",
     "groot": "nvidia/GR00T-H",
 }
+
+
+def resize_image_for_vlm(image: Image.Image, pil_side: int) -> Image.Image:
+    """Square resize — same tensor geometry as VLM inference and viz overlays."""
+    side = max(1, int(pil_side))
+    return image.convert("RGB").resize(
+        (side, side),
+        resample=Image.Resampling.BICUBIC,
+    )
 
 
 def _viz_slug(frame_stem: str, instrument_id: str, region_id: str) -> str:
@@ -318,10 +327,8 @@ def _run_vlm_on_sample(
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     try:
-        image = image.convert("RGB").resize(
-            (pil_side, pil_side),
-            resample=Image.Resampling.BICUBIC,
-        )
+        _ = pil_side  # caller must pass image already resized to (pil_side, pil_side)
+        image = image.convert("RGB")
         gen_kw: dict[str, Any] = {"do_sample": args.do_sample, "min_length": 1}
         if args.do_sample:
             gen_kw["temperature"] = args.temperature
@@ -427,6 +434,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip VLM; (re)build visualizations from existing results JSON (--output).",
     )
+    p.add_argument(
+        "--viz-side",
+        type=int,
+        default=None,
+        help="Viz/VLM square side (default: backend image_size or 384). Used for --viz-only.",
+    )
     return p.parse_args()
 
 
@@ -467,12 +480,20 @@ def main() -> None:
     )
     viz_root = out_path.parent / "visualizations"
 
+    def _resolve_pil_side(payload: dict[str, Any] | None = None) -> int:
+        if args.viz_side is not None:
+            return max(1, int(args.viz_side))
+        if payload is not None and payload.get("vlm_input_side") is not None:
+            return max(1, int(payload["vlm_input_side"]))
+        return max(1, int(infer_pil_side(args)))
+
     if args.viz_only:
         if not out_path.is_file():
             raise FileNotFoundError(f"--viz-only requires existing results: {out_path}")
         with out_path.open("r", encoding="utf-8") as f:
             payload = json.load(f)
         results = payload.get("results") or []
+        pil_side = _resolve_pil_side(payload)
         n_viz = 0
         for rec in results:
             inp = rec.get("input") or {}
@@ -480,7 +501,9 @@ def main() -> None:
             if not img_path:
                 continue
             try:
-                pil_image = Image.open(img_path).convert("RGB")
+                vlm_image = resize_image_for_vlm(
+                    Image.open(img_path), pil_side,
+                )
             except Exception as e:
                 print(f"SKIP viz {img_path}: {e}", file=sys.stderr)
                 continue
@@ -489,15 +512,21 @@ def main() -> None:
                 if ev:
                     rec["evaluation"] = ev
             paths = save_localization_visualizations(
-                rec, pil_image, viz_root, force=args.force,
+                rec, vlm_image, viz_root, force=args.force,
             )
             _attach_visualization_paths(rec, paths)
             n_viz += 1
         payload["visualization_root"] = str(viz_root.resolve())
         payload["visualization_count"] = n_viz
+        payload["vlm_input_side"] = pil_side
+        payload["visualization_image_size"] = [pil_side, pil_side]
         with out_path.open("w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
-        print(f"Wrote {n_viz} visualizations under {viz_root}", file=sys.stderr)
+        print(
+            f"Wrote {n_viz} visualizations under {viz_root} "
+            f"({pil_side}x{pil_side}, VLM resize space)",
+            file=sys.stderr,
+        )
         return
 
     print(
@@ -520,7 +549,12 @@ def main() -> None:
         device=device,
     )
     backend.to(device, dtype=torch.bfloat16)
-    pil_side = getattr(backend, "image_size", None) or infer_pil_side(args)
+    pil_side = (
+        _resolve_pil_side()
+        if args.viz_side is not None
+        else (getattr(backend, "image_size", None) or infer_pil_side(args))
+    )
+    pil_side = max(1, int(pil_side))
 
     results, key_to_idx = load_results_for_resume(out_path)
     vlm_calls = 0
@@ -530,7 +564,7 @@ def main() -> None:
         sample: dict[str, Any],
         frame_output: dict[str, Any] | None,
         *,
-        pil_image: Image.Image | None = None,
+        vlm_image: Image.Image | None = None,
     ) -> dict[str, Any]:
         pk = (sample["instrument_id"], sample["region_id"])
         if pk not in prompt_cache:
@@ -549,9 +583,9 @@ def main() -> None:
         ev = _score_record(entry)
         if ev:
             entry["evaluation"] = ev
-        if args.viz and pil_image is not None:
+        if args.viz and vlm_image is not None:
             paths = save_localization_visualizations(
-                entry, pil_image, viz_root, force=args.force,
+                entry, vlm_image, viz_root, force=args.force,
             )
             _attach_visualization_paths(entry, paths)
         upsert_result(results, key_to_idx, row_key, entry)
@@ -572,9 +606,11 @@ def main() -> None:
                 rec["evaluation"] = ev
             if args.viz:
                 try:
-                    pil_image = Image.open(sample["img_path"]).convert("RGB")
+                    vlm_image = resize_image_for_vlm(
+                        Image.open(sample["img_path"]), pil_side,
+                    )
                     paths = save_localization_visualizations(
-                        rec, pil_image, viz_root, force=args.force,
+                        rec, vlm_image, viz_root, force=args.force,
                     )
                     _attach_visualization_paths(rec, paths)
                     upsert_result(results, key_to_idx, row_key, rec)
@@ -586,7 +622,9 @@ def main() -> None:
             continue
 
         try:
-            pil_image = Image.open(sample["img_path"]).convert("RGB")
+            vlm_image = resize_image_for_vlm(
+                Image.open(sample["img_path"]), pil_side,
+            )
         except Exception as e:
             print(f"SKIP {sample['frame_stem']}: {e}", file=sys.stderr)
             _upsert_scored(sample, {"error": str(e)})
@@ -602,13 +640,13 @@ def main() -> None:
         frame_output = _run_vlm_on_sample(
             backend=backend,
             pil_side=pil_side,
-            image=pil_image,
+            image=vlm_image,
             user_prompt=prompt_cache[pk],
             sample=sample,
             args=args,
         )
         vlm_calls += 1
-        _upsert_scored(sample, frame_output, pil_image=pil_image)
+        _upsert_scored(sample, frame_output, vlm_image=vlm_image)
 
         if vlm_calls % 25 == 0:
             print(f"  ... {vlm_calls} VLM calls", file=sys.stderr)
@@ -634,6 +672,8 @@ def main() -> None:
         "frames_root": str(frames_root),
         "annotations_root": str(ann_root),
         "image_size": [ENDOVIS17_IMAGE_WIDTH, ENDOVIS17_IMAGE_HEIGHT],
+        "vlm_input_side": pil_side,
+        "visualization_image_size": [pil_side, pil_side],
         "backend": args.backend,
         "model_id": meta.get("model_id") if meta.get("source") == "local_checkpoint" else model_id,
         "hub_model_id_cli": model_id,

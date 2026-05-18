@@ -68,8 +68,9 @@ CHOLEC80_VIDEO_FPS = 25
 CHOLEC80_EVAL_FPS = 0.1
 CHOLEC80_EVAL_FRAME_STRIDE = int(round(CHOLEC80_VIDEO_FPS / CHOLEC80_EVAL_FPS))
 CHOLEC80_EVAL_FRAMES_DIRNAME = "frames_0p1fps"
-# Relative to surgical_vlm_test/ (same as $ROOT/../eval/cholec80/frames_0p1fps in shell).
-CHOLEC80_EVAL_FRAMES_RELPATH = Path("../eval/cholec80") / CHOLEC80_EVAL_FRAMES_DIRNAME
+# Relative to surgical_vlm_test/ (eval frame dataset under ../eval/cholec80/).
+CHOLEC80_EVAL_DATA_RELPATH = Path("../eval/cholec80")
+CHOLEC80_EVAL_FRAMES_RELPATH = CHOLEC80_EVAL_DATA_RELPATH / CHOLEC80_EVAL_FRAMES_DIRNAME
 CHOLEC80_EVAL_PHASE_FILENAME_SUFFIX = "-phase.txt"
 
 _IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
@@ -129,9 +130,14 @@ def video_in_split(vid_num: int, split: str) -> bool:
     raise ValueError(f"Unknown split {split!r}; use eval, train, or all.")
 
 
+def package_eval_data_root() -> Path:
+    """Resolved path: surgical_vlm_test/../eval/cholec80."""
+    return (_PKG_ROOT / CHOLEC80_EVAL_DATA_RELPATH).resolve()
+
+
 def package_eval_frames_root() -> Path:
     """Resolved path: surgical_vlm_test/../eval/cholec80/frames_0p1fps."""
-    return (_PKG_ROOT / CHOLEC80_EVAL_FRAMES_RELPATH).resolve()
+    return (package_eval_data_root() / CHOLEC80_EVAL_FRAMES_DIRNAME).resolve()
 
 
 def default_eval_frames_root(dataset_root: Path | None = None) -> Path:
@@ -158,6 +164,9 @@ def resolve_eval_frames_root(
     env = __import__("os").environ.get("CHOLEC80_FRAMES_ROOT", "").strip()
     if env:
         candidates.append(Path(env).resolve())
+    eval_env = __import__("os").environ.get("CHOLEC80_EVAL_ROOT", "").strip()
+    if eval_env:
+        candidates.append((Path(eval_env) / CHOLEC80_EVAL_FRAMES_DIRNAME).resolve())
     candidates.append(package_eval_frames_root())
     if dataset_root is not None:
         candidates.append((dataset_root / CHOLEC80_EVAL_FRAMES_DIRNAME).resolve())
@@ -331,6 +340,43 @@ def load_phase_annotation_rows(
     return rows
 
 
+def list_videos_in_frames_root(
+    frames_root: Path,
+    *,
+    split: str = "eval",
+    video_filter: int | None = None,
+) -> list[tuple[int, Path]]:
+    """
+    Videos present under eval frame dataset: frames_root/videoNN/videoNN-phase.txt.
+    """
+    root = frames_root.resolve()
+    if not root.is_dir():
+        return []
+    out: list[tuple[int, Path]] = []
+    for vdir in sorted(root.iterdir()):
+        if not vdir.is_dir():
+            continue
+        vid = parse_video_id(vdir.name)
+        if vid is None:
+            continue
+        if video_filter is not None and vid != video_filter:
+            continue
+        if not video_in_split(vid, split):
+            continue
+        phase_path = vdir / phase_annotation_filename(vid)
+        if not phase_path.is_file():
+            matches = sorted(vdir.glob("*-phase.txt"))
+            if not matches:
+                print(
+                    f"WARN: skip {vdir.name}: no *-phase.txt under {vdir}",
+                    file=__import__("sys").stderr,
+                )
+                continue
+            phase_path = matches[0]
+        out.append((vid, phase_path.resolve()))
+    return out
+
+
 def list_phase_annotation_files(
     dataset_root: Path,
     *,
@@ -387,20 +433,49 @@ def collect_phase_samples(
     frame_stride: int | None = None,
     max_frames_per_video: int | None = None,
     frames_root: Path | None = None,
+    require_frame_images: bool | None = None,
 ) -> list[dict[str, Any]]:
-    """Build evaluation items: one row per (video, frame_index) at eval fps by default."""
+    """
+    Build evaluation items: one row per (video, frame_index).
+
+    When frames_root is set (default eval/cholec80/frames_0p1fps), enumerate videos
+    from that tree and use local videoNN-phase.txt manifests (stride 1).
+    """
     video_dir = dataset_root / "videos"
     items: list[dict[str, Any]] = []
-    for vid_num, _native_phase_path in list_phase_annotation_files(
-        dataset_root,
-        split=split,
-        video_filter=video_filter,
-    ):
-        phase_path, ann_stride = resolve_phase_annotation_for_eval(
-            dataset_root,
-            vid_num,
-            frames_root,
+    frames_root_resolved = frames_root.resolve() if frames_root is not None else None
+    use_eval_frames = frames_root_resolved is not None and frames_root_resolved.is_dir()
+    if require_frame_images is None:
+        require_frame_images = use_eval_frames
+
+    frame_videos = (
+        list_videos_in_frames_root(
+            frames_root_resolved,
+            split=split,
+            video_filter=video_filter,
         )
+        if use_eval_frames
+        else []
+    )
+
+    if frame_videos:
+        video_jobs = [(vid, phase_path, 1) for vid, phase_path in frame_videos]
+    else:
+        video_jobs = []
+        for vid_num, _native in list_phase_annotation_files(
+            dataset_root,
+            split=split,
+            video_filter=video_filter,
+        ):
+            phase_path, ann_stride = resolve_phase_annotation_for_eval(
+                dataset_root,
+                vid_num,
+                frames_root_resolved,
+            )
+            video_jobs.append((vid_num, phase_path, ann_stride))
+
+    missing_png = 0
+    for vid_num, phase_path, ann_stride in video_jobs:
         load_stride = ann_stride
         if frame_stride is not None:
             load_stride = max(1, int(frame_stride))
@@ -409,7 +484,9 @@ def collect_phase_samples(
         if not video_path.is_file():
             alt = video_dir / f"video{vid_num}.mp4"
             video_path = alt if alt.is_file() else video_path
-        if not video_path.is_file():
+        if not video_path.is_file() and frames_root_resolved is not None:
+            video_path = (frames_root_resolved / stem).resolve()
+        if not video_path.exists() and not require_frame_images:
             print(f"WARN: missing video {video_path}", file=__import__("sys").stderr)
             continue
         for fi, phase_id in load_phase_annotation_rows(
@@ -418,8 +495,11 @@ def collect_phase_samples(
             max_frames=max_frames_per_video,
         ):
             img_path = None
-            if frames_root is not None:
-                img_path = resolve_frame_image_path(stem, fi, frames_root)
+            if frames_root_resolved is not None:
+                img_path = resolve_frame_image_path(stem, fi, frames_root_resolved)
+            if require_frame_images and img_path is None:
+                missing_png += 1
+                continue
             items.append(
                 {
                     "vid_num": vid_num,
@@ -427,12 +507,19 @@ def collect_phase_samples(
                     "frame_index": fi,
                     "phase_id": phase_id,
                     "phase_display": CANONICAL_TO_DISPLAY.get(phase_id, phase_id),
-                    "video_path": video_path.resolve(),
+                    "video_path": Path(img_path or video_path).resolve(),
                     "phase_annotation": phase_path.resolve(),
                     "phase_manifest_eval": ann_stride == 1,
                     "img_path": img_path,
+                    "eval_frames_root": str(frames_root_resolved) if frames_root_resolved else None,
                 }
             )
+
+    if require_frame_images and missing_png:
+        print(
+            f"WARN: skipped {missing_png} rows with no PNG under {frames_root_resolved}",
+            file=__import__("sys").stderr,
+        )
     return items
 
 

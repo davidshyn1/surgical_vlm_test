@@ -25,8 +25,10 @@ from backends import load_backend
 from cholec80_data import (
     CHOLEC80_EVAL_FPS,
     CHOLEC80_EVAL_FRAME_STRIDE,
+    CHOLEC80_EVAL_DATA_RELPATH,
     CHOLEC80_EVAL_FRAMES_RELPATH,
     CANONICAL_TO_DISPLAY,
+    package_eval_data_root,
     package_eval_frames_root,
     PHASE_CANONICAL_IDS,
     PHASE_DISPLAY_NAMES,
@@ -414,7 +416,16 @@ def main() -> None:
     )
     if not samples:
         raise RuntimeError(
-            "No phase samples found. Check dataset path and --split/--video.")
+            "No phase samples found. Check --frames-root (eval/cholec80/frames_0p1fps), "
+            "--split, and --video."
+        )
+
+    n_with_img = sum(1 for s in samples if s.get("img_path"))
+    if n_with_img < len(samples):
+        raise RuntimeError(
+            f"Missing PNGs for {len(samples) - n_with_img}/{len(samples)} samples under "
+            f"{frames_root}. Re-run scripts/extract_cholec80_frames.sh."
+        )
 
     model_name = re.sub(r"[^a-zA-Z0-9._-]+", "_",
                         (args.model_name or "original").strip() or "original")
@@ -439,7 +450,7 @@ def main() -> None:
         ).resolve()
     )
 
-    n_with_img = sum(1 for s in samples if s.get("img_path"))
+    eval_data_root = package_eval_data_root()
     reader_note = (
         f"frames_root={frames_root} ({n_with_img}/{len(samples)} on disk)"
         if frames_root
@@ -545,6 +556,8 @@ def main() -> None:
         "eval_protocol": "cholec80_phase_recognition",
         "dataset": "cholec80",
         "dataset_root": str(dataset_root),
+        "eval_data_root": str(eval_data_root),
+        "eval_frames_relpath": str(CHOLEC80_EVAL_FRAMES_RELPATH),
         "split": args.split,
         "eval_video_range": "41-80" if args.split == "eval" else ("1-40" if args.split == "train" else "1-80"),
         "frame_stride": stride_label,

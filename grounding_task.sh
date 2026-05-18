@@ -20,7 +20,8 @@ export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 : "${CHOLECT50_CHALLENGE_VAL_ROOT:=$ROOT/../eval/cholect50-challenge-val}"
 : "${CHOLECT50_VIDEOS_ROOT:=}"
 : "${CHOLEC80_ROOT:=$ROOT/../data/Cholec80}"
-: "${CHOLEC80_FRAMES_ROOT:=$ROOT/../eval/cholec80/frames_0p1fps}"
+: "${CHOLEC80_EVAL_ROOT:=$ROOT/../eval/cholec80}"
+: "${CHOLEC80_FRAMES_ROOT:=$CHOLEC80_EVAL_ROOT/frames_0p1fps}"
 : "${ENDOVIS17_VQLA_ROOT:=$ROOT/../eval/EndoVis-17-VQLA}"
 
 guess_conda_python() {
@@ -158,7 +159,8 @@ Env:
   CHOLECT50_CHALLENGE_VAL_ROOT  default: ../eval/cholect50-challenge-val
   CHOLECT50_VIDEOS_ROOT         frame images (required if not under dataset-root/videos)
   CHOLEC80_ROOT                 default: ../data/Cholec80 (falls back to ../data/cholec80)
-  CHOLEC80_FRAMES_ROOT          0.1 fps frames (default: ../eval/cholec80/frames_0p1fps)
+  CHOLEC80_EVAL_ROOT            eval frame dataset root (default: ../eval/cholec80)
+  CHOLEC80_FRAMES_ROOT          0.1 fps PNGs + phase txt (default: $CHOLEC80_EVAL_ROOT/frames_0p1fps)
   ENDOVIS17_VQLA_ROOT           default: ../eval/EndoVis-17-VQLA
   DEVICE_VISIBLE                -> CUDA_VISIBLE_DEVICES (default 0)
   MODEL_ID                      default --model-id when omitted

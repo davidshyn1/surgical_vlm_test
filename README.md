@@ -21,7 +21,8 @@ CholecT50 **triplet recognition** · Cholec80 **phase recognition** · EndoVis-1
 | `backends.py` | VLM 로드·추론 |
 | `grounding_task.sh` | 실행 런처 (`uv` + 백엔드 venv) |
 | `setup_backend.sh` | 백엔드 `.venv` 설치 (uv) |
-| `scripts/extract_cholec80_frames.sh` | Cholec80 프레임 추출 (ffmpeg, 기본 video41–80) |
+| `scripts/extract_cholec80_frames.sh` | Cholec80 0.1 fps 프레임 추출 → `../eval/cholec80/frames_0p1fps` |
+| `scripts/build_cholec80_eval_phase_annotations.py` | eval frame용 `videoNN-phase.txt` manifest 생성 |
 
 ---
 
@@ -87,19 +88,38 @@ target: abd-wall/cavity, adhesion, ...
 **Phase recognition** — 담낭절제 영상 프레임을 7개 수술 단계 중 하나로 분류합니다.
 
 - **프롬프트**: *"In the Cholecystectomy surgical image, what is the current Phase? The available phase options are …"* (A–G)
-- **데이터**: `../data/Cholec80` (없으면 `../data/cholec80` 자동 탐색)
-- **기본 split**: `eval` = **video41–video80** (EndoNet evaluation set)
+- **기본 split**: `eval` = **video41–video80** (EndoNet evaluation set, 약 **9.8k** frame @ 0.1 fps)
 - **지표**: Accuracy, 클래스별 Recall / Precision / Jaccard, macro 평균
 
-비디오 MP4에서 프레임을 읽습니다. **OpenCV는 필수가 아닙니다** (numpy pin 환경 권장 경로 아래 참고).  
-Cholec80은 **전 비디오 25 fps**이며, phase annotation은 **매 프레임**입니다.  
-기본 eval은 **0.1 fps** (stride **250**: 0, 250, 500, …)이며, `frames_0p1fps/`에 PNG + `videoNN-phase.txt` manifest를 둡니다.
+#### 데이터 경로 (역할 분리)
+
+| 경로 | 역할 |
+|------|------|
+| `../data/cholec80` (`CHOLEC80_ROOT`) | 원본 MP4, 25 fps `phase_annotations/` (추출·manifest 생성 시 참조) |
+| `../eval/cholec80/frames_0p1fps` (`CHOLEC80_FRAMES_ROOT`) | **평가용** PNG + phase manifest (`phase_recognition` 기본 입력) |
+
+**Eval frame 레이아웃** (`surgical_vlm_test` 기준 상대 경로 `../eval/cholec80/frames_0p1fps`):
+
+```
+frames_0p1fps/
+  video41/
+    000000.png          # 비디오 프레임 인덱스 0
+    000250.png          # 인덱스 250 (0.1 fps, stride 250 @ 25 fps)
+    ...
+    video41-phase.txt   # Frame\tPhase (동일 인덱스)
+  video42/
+    ...
+```
+
+- PNG 파일명 `FFFFFF` = annotation `Frame` 컬럼 = 원본 MP4의 0-based frame index
+- `phase_recognition`은 이 트리에서 **비디오 목록·라벨·이미지**를 모두 읽음 (MP4 디코드 불필요)
+- 원본 phase annotation은 **25 fps**(매 프레임); eval manifest는 **0.1 fps** subsample (0, 250, 500, …)
 
 | 설정 | 샘플링 | 용도 |
 |------|--------|------|
-| 기본 (`frames_0p1fps` manifest) | **0.1 fps** | 권장 eval |
-| `--frame-stride 250` (MP4 직접) | **0.1 fps** | manifest 없이 동일 간격 |
-| `--frame-stride 1` | **25 fps** (전 annotated frame) | 매우 느림 |
+| 기본 (`--frames-root` = eval manifest) | **0.1 fps** | 권장 eval |
+| `--frame-stride 250` + MP4 (`--frames-root` 없음) | **0.1 fps** | 추출본 없을 때 |
+| `--frame-stride 1` | **25 fps** | 매우 느림 (~98k+ calls / eval 40 videos) |
 
 7개 phase: Preparation, Calot Triangle Dissection, Clipping and Cutting, Gallbladder Dissection, Gallbladder Packaging, Cleaning and Coagulation, Gallbladder Retraction.
 
@@ -123,7 +143,7 @@ If the Large Needle Driver is not in the image, answer exactly: not present
 - **GT bbox**: annotation 픽셀 좌표 → 원본 W/H 기준 normalized xyxy 저장
 - **Cosmos**: 모델 출력이 0–1000 스케일이면 파서에서 **÷1000** 후 [0,1]로 metric 계산
 - **지표** (`metrics` in JSON): **mIoU**, **mAP@50**, **mAP@75**, **COCO AP** (IoU 0.5:0.05:0.95)
-- **시각화** (기본 `--viz`): `visualizations/gt/`, `pred/`, `comparison/` — 박스 위·좌상단에 **instrument 이름만** 표시
+- **시각화** (기본 `--viz`): VLM과 동일한 **resize 이미지** (`pil_side`×`pil_side`, 예: 384×384) 위에 GT/Pred bbox — `visualizations/gt|pred|comparison/`, **instrument 이름만** 표시
 
 5종 instrument: Bipolar Forceps, Large Needle Driver, Monopolar Curved Scissors, Prograsp Forceps, Ultrasound Probe.  
 전체 localization 쿼리 **236개** (`Where is … located?` 행만 사용).
@@ -143,9 +163,11 @@ If the Large Needle Driver is not in the image, answer exactly: not present
 
 **Cholec80 (phase)**
 
-- 루트: `<surgical repo>/data/cholec80` (`CHOLEC80_ROOT` 또는 `--dataset-root`)
-- `videos/videoNN.mp4`, `phase_annotations/videoNN-phase.txt`
-- 평가 기본: video **41–80**
+- 원본: `<surgical repo>/data/cholec80` — `videos/videoNN.mp4`, `phase_annotations/videoNN-phase.txt` (25 fps)
+- **Eval frames (기본)**: `<surgical repo>/eval/cholec80/frames_0p1fps/`
+  - `videoNN/{frame:06d}.png` + `videoNN/videoNN-phase.txt`
+  - eval split: video **41–80**
+- 추출 스크립트 출력 기본: `../eval/cholec80/frames_0p1fps` (`extract_cholec80_frames.sh`)
 
 **EndoVis-17 (localization)**
 
@@ -173,25 +195,32 @@ bash setup_backend.sh prismatic    # 하나만
 - `cosmos-reason2/.venv`
 - `GR00T-H/.venv`
 
-**Cholec80 프레임 로딩 (numpy pin 시 권장 순서)**
+**Cholec80 eval frame 준비 (최초 1회)**
 
-1. **`ffmpeg` on PATH** (기본, `auto`) — pip 추가 설치 없음, numpy와 무관  
-2. **`--frames-root`** — 미리 뽑아 둔 PNG/JPG (`video41/000250.png`), PIL만 사용  
-3. **OpenCV** (`--frame-reader opencv`) — venv에 이미 `cv2`가 있을 때만.  
-   `opencv-python-headless`를 새로 깔면 **numpy 버전 충돌**이 날 수 있음 → 피하는 것을 권장
+`extract_cholec80_frames.sh`는 비디오당 **ffmpeg 1회** 디코드로 0.1 fps PNG를 뽑고, 같은 폴더에 `videoNN-phase.txt`를 씁니다.
 
 ```bash
-# (선택) eval 41–80, 0.1 fps 프레임 + phase manifest 추출 — 한 번만 실행
+cd surgical_vlm_test
+
+# eval 41–80 → ../eval/cholec80/frames_0p1fps/
 CHOLEC80_ROOT=../data/cholec80 bash scripts/extract_cholec80_frames.sh
 
-# manifest만 생성
-python3 scripts/build_cholec80_eval_phase_annotations.py --dataset-root ../data/cholec80
+# PNG만 있고 manifest만 다시 만들 때
+python3 scripts/build_cholec80_eval_phase_annotations.py \
+  --dataset-root ../data/cholec80 --overwrite
+```
 
-# 추출본으로 eval (가장 안전)
-CHOLEC80_FRAMES_ROOT=../data/cholec80/frames_0p1fps \
-  bash grounding_task.sh phase_recognition_cholec80
+**Cholec80 프레임 로딩 (eval 시 권장)**
 
-# 또는 ffmpeg로 MP4에서 바로 (추출 없이, stride 250 ≈ 0.1 fps)
+1. **`--frames-root ../eval/cholec80/frames_0p1fps`** (기본) — PIL만, 가장 빠름·안정  
+2. **`ffmpeg`** (`--frame-reader auto`, MP4 직접) — 추출본 없을 때  
+3. **OpenCV** — venv에 `cv2`가 있을 때만 (새로 설치 시 numpy 충돌 주의)
+
+```bash
+# 기본 eval (grounding_task.sh가 frames-root·split 자동 주입)
+bash grounding_task.sh phase_recognition_cholec80
+
+# MP4에서 직접 (추출본 없을 때만)
 bash grounding_task.sh phase_recognition_cholec80 --frame-stride 250
 ```
 
@@ -251,34 +280,29 @@ BACKEND=cosmos MODEL_ID=nvidia/Cosmos-Reason2-2B DEVICE_VISIBLE=0 \
 
 #### Cholec80 phase
 
-`grounding_task.sh`가 기본으로 `--dataset-root $CHOLEC80_ROOT`, `--split eval`(video41–80)을 넣습니다.
+`grounding_task.sh` 기본 주입:
 
-**스모크 테스트** (video 41, sparse frames):
+- `--dataset-root` → `$CHOLEC80_ROOT` (`../data/cholec80`)
+- `--frames-root` → `$CHOLEC80_FRAMES_ROOT` (`../eval/cholec80/frames_0p1fps`)
+- `--split eval` (video41–80)
+
+**스모크 테스트** (video 41, 5 frame):
 
 ```bash
 BACKEND=prismatic DEVICE_VISIBLE=0 \
   bash grounding_task.sh phase_recognition_cholec80 \
-    --video 41 --frame-stride 250 --max-frames-per-video 5
+    --video 41 --max-frames-per-video 5
 ```
 
-**Eval 41–80, 0.1 fps** (기본 `frames_0p1fps`):
+**Eval 41–80, 0.1 fps** (eval frame dataset, 기본):
 
 ```bash
 BACKEND=prismatic DEVICE_VISIBLE=0 \
   bash grounding_task.sh phase_recognition_cholec80
 ```
 
-**전체 annotated frame (25 fps)**:
-
-```bash
-bash grounding_task.sh phase_recognition_cholec80 --frame-stride 1
-```
-
-**Train split (video01–40)**:
-
-```bash
-bash grounding_task.sh phase_recognition_cholec80 --split train
-```
+> **Train split (video01–40)** 또는 **25 fps** 전체 eval은 기본 파이프라인이 아닙니다.  
+> train용 frame이 필요하면 `VID_START=1 VID_END=40 bash scripts/extract_cholec80_frames.sh` 후 `--split train`으로 실행하세요.
 
 #### EndoVis-17 localization
 
@@ -337,7 +361,7 @@ uv run --python ../backend/prismatic-vlms/.venv/bin/python \
   --backend prismatic \
   --dataset-root ../data/cholec80 \
   --split eval \
-  --frames-root ../data/cholec80/frames_0p1fps
+  --frames-root ../eval/cholec80/frames_0p1fps
 ```
 
 **EndoVis-17**:
@@ -371,8 +395,8 @@ uv run --python ../backend/prismatic-vlms/.venv/bin/python \
 | 인자 | 설명 |
 |------|------|
 | `--split {eval,train,all}` | `eval`=video41–80 (기본), `train`=01–40 |
-| `--frame-stride N` | native phase에서 N프레임마다 1장 (manifest 없을 때 기본 `250` ≈ 0.1 fps) |
-| `--frames-root` | 추출 프레임 루트 (`video41/000123.png`) |
+| `--frame-stride N` | native 25 fps phase subsample (manifest 없을 때 `250` ≈ 0.1 fps) |
+| `--frames-root` | eval frame 루트 (기본: `../eval/cholec80/frames_0p1fps`; `video41/000250.png` + `video41-phase.txt`) |
 | `--frame-reader {auto,ffmpeg,opencv}` | MP4 디코드 방식 (기본 `auto` = ffmpeg 우선) |
 | `--max-frames-per-video K` | 비디오당 최대 K장 (디버그용) |
 | `--video 41` | 단일 비디오 (`41`, `video41` 모두 가능) |
@@ -388,8 +412,9 @@ uv run --python ../backend/prismatic-vlms/.venv/bin/python \
 | `--annotations-root` | `vqla/` (기본: dataset-root/vqla) |
 | `--instrument`, `--region`, `--frame` | 필터 (instrument id, region id, frame stem) |
 | `--max-samples N` | 랜덤 subsample (디버그; 생략 시 236개 전체) |
-| `--viz` / `--no-viz` | GT/Pred/comparison JPEG (기본: viz 켜짐) |
+| `--viz` / `--no-viz` | GT/Pred/comparison JPEG on VLM resize (기본: viz 켜짐) |
 | `--viz-only` | VLM 생략, 기존 JSON에서 시각화만 생성 (`--output` 필수) |
+| `--viz-side N` | viz/VLM square side (`--viz-only`·구 JSON용, 기본: backend 또는 384) |
 | `--force` / `--output` | resume·재추론·결과 경로 |
 
 **공통**: `--backend`, `--model-id`, `--device`, `--hf-token`, `--max-new-tokens`
@@ -399,14 +424,14 @@ uv run --python ../backend/prismatic-vlms/.venv/bin/python \
 | 태스크 | 기본 JSON 경로 |
 |--------|----------------|
 | Triplet | `outputs/triplet_recognition_cholect50/triplet_{backend}_{model}_{mcq\|ov}_{joint\|sequential_*}/cholect50_challenge_val_triplet.json` |
-| Phase | `outputs/phase_recognition_cholec80/phase_{backend}_{model}_{split}/cholec80_phase_stride{N}.json` |
+| Phase | `outputs/phase_recognition_cholec80/phase_{backend}_{model}_{split}/cholec80_phase_0p1fps_manifest.json` (eval frames 사용 시) |
 | EndoVis-17 | `outputs/instrument_localization_endovis17/loc_{backend}_{model}/endovis17_instrument_localization.json` |
 
-EndoVis-17 시각화 (같은 폴더):
+EndoVis-17 시각화 (VLM 입력과 동일한 `vlm_input_side`×`vlm_input_side` JPEG):
 
 ```
 loc_{backend}_{model}/
-  endovis17_instrument_localization.json
+  endovis17_instrument_localization.json   # vlm_input_side, visualization_image_size
   visualizations/
     gt/          {frame}_{instrument}_{region}_gt.jpg
     pred/        ..._pred.jpg
@@ -436,8 +461,9 @@ JSON `metrics` (phase): `accuracy`, `macro_recall`, `macro_precision`, `macro_ja
 | `MODEL_ID` | `--model-id` 자동 주입 |
 | `CHOLECT50_CHALLENGE_VAL_ROOT` | triplet `--dataset-root` (기본: `../eval/cholect50-challenge-val`) |
 | `CHOLECT50_VIDEOS_ROOT` | triplet `--videos-root` |
-| `CHOLEC80_ROOT` | phase `--dataset-root` (기본: `../data/Cholec80`, 없으면 `../data/cholec80`) |
-| `CHOLEC80_FRAMES_ROOT` | phase `--frames-root` (추출 PNG 루트, 선택) |
+| `CHOLEC80_ROOT` | phase `--dataset-root` (기본: `../data/Cholec80`, `cholec80` 폴백) |
+| `CHOLEC80_EVAL_ROOT` | eval 데이터 루트 (기본: `../eval/cholec80`) |
+| `CHOLEC80_FRAMES_ROOT` | phase `--frames-root` (기본: `$CHOLEC80_EVAL_ROOT/frames_0p1fps`) |
 | `ENDOVIS17_VQLA_ROOT` | localization `--dataset-root` (기본: `../eval/EndoVis-17-VQLA`) |
 | `PRISMATIC_PYTHON` / `COSMOS_PYTHON` / `GROOT_PYTHON` | venv python 경로 override |
 | `GROUNDING_TASK_AUTO_BACKEND_SETUP` | `0`이면 uv 자동 설치 스킵 |
@@ -453,7 +479,7 @@ JSON `metrics` (phase): `accuracy`, `macro_recall`, `macro_precision`, `macro_ja
 | Cholec80 | `phase_recognition_cholec80.py` | (별도 phase 스크립트 없음) |
 | EndoVis-17 | `instrument_localization_endovis17.py` | (동일 벤치, 다른 패키지) |
 | Bbox | EndoVis-17만 (normalized xyxy + viz) | CholecT50 localization 등 |
-| 입력 | T50: 추출 프레임 / C80: MP4·추출 PNG | 주로 추출 프레임 |
+| 입력 | T50: 추출 프레임 / C80: `eval/cholec80/frames_0p1fps` PNG+manifest | 주로 추출 프레임 |
 | Triplet | `joint` 1질문/프레임 또는 `sequential_*` 3질문/annotation | multi-step localization |
 | Phase | 7-class MCQ (A–G) | localization + phase |
 | 추론 | task·프로토콜별 (T50 joint=1회/프레임) | task별 상이 |
@@ -463,17 +489,18 @@ JSON `metrics` (phase): `accuracy`, `macro_recall`, `macro_precision`, `macro_ja
 ## 7. 문제 해결
 
 1. **CholecT50 프레임 이미지 없음** — `CHOLECT50_VIDEOS_ROOT` 또는 `--videos-root` 확인  
-2. **Cholec80 데이터 없음** — `CHOLEC80_ROOT` 또는 `--dataset-root`에 `phase_annotations/`, `videos/` 있는지 확인 (`Cholec80` vs `cholec80` 대소문자 폴백 지원)  
-3. **프레임 로드 실패** — `ffmpeg -version` 확인, 또는 `scripts/extract_cholec80_frames.sh` 후 `CHOLEC80_FRAMES_ROOT` 사용 (`opencv` 설치보다 권장)  
-4. **백엔드 import 실패** — `bash setup_backend.sh <backend>`  
-5. **HF 401** — `.hf_token` 경로 및 권한  
-6. **resume** — 동일 `--output` JSON에 이어서 실행; 전체 재실행은 `--force`  
-7. **triplet sequential이 느림** — annotation당 VLM 3회; 빠른 테스트는 `--eval-protocol joint` 또는 `--samples-only`  
-8. **phase eval이 너무 느림** — 기본 `frames_0p1fps`(0.1 fps); `--frame-stride 1`은 eval 40 videos 기준 약 98k+ calls  
-9. **프롬프트/프로토콜 변경 후** — 이전 JSON과 혼동 방지를 위해 `--force` 권장  
-10. **EndoVis-17 데이터 없음** — `eval/EndoVis-17-VQLA/left_frames`, `vqla/` 확인  
-11. **Cosmos bbox 이상** — 0–1000 출력은 자동 ÷1000; [0,1]로 직접 내면 그대로 사용  
-12. **EndoVis viz만 다시** — `--viz-only --output <기존 json>` (`--force`로 JPEG 덮어쓰기)
+2. **Cholec80 원본 없음** — `CHOLEC80_ROOT`에 `phase_annotations/`, `videos/` 확인 (`Cholec80` vs `cholec80` 폴백)  
+3. **Cholec80 eval frame 없음** — `../eval/cholec80/frames_0p1fps/video41/000000.png` 및 `video41-phase.txt` 확인; 없으면 `bash scripts/extract_cholec80_frames.sh`  
+4. **프레임 로드 실패** — eval PNG 경로·파일명(`{frame:06d}.png`)이 manifest `Frame`과 일치하는지 확인; MP4 fallback은 `ffmpeg` 필요  
+5. **백엔드 import 실패** — `bash setup_backend.sh <backend>`  
+6. **HF 401** — `.hf_token` 경로 및 권한  
+7. **resume** — 동일 `--output` JSON에 이어서 실행; 전체 재실행은 `--force`  
+8. **triplet sequential이 느림** — annotation당 VLM 3회; 빠른 테스트는 `--eval-protocol joint` 또는 `--samples-only`  
+9. **phase eval이 너무 느림** — 기본 `../eval/cholec80/frames_0p1fps`(0.1 fps, ~9.8k calls); 25 fps는 `--frame-stride 1`  
+10. **프롬프트/프로토콜 변경 후** — 이전 JSON과 혼동 방지를 위해 `--force` 권장  
+11. **EndoVis-17 데이터 없음** — `eval/EndoVis-17-VQLA/left_frames`, `vqla/` 확인  
+12. **Cosmos bbox 이상** — 0–1000 출력은 자동 ÷1000; [0,1]로 직접 내면 그대로 사용  
+13. **EndoVis viz만 다시** — `--viz-only --output <기존 json>` (`--force`로 JPEG 덮어쓰기)
 
 ```bash
 python triplet_recognition_cholect50.py --help
