@@ -3,8 +3,8 @@ triplet_recognition_cholect50.py
 
 CholecT50 triplet recognition (instrument, verb, target) — single-prompt evaluation.
 
-  - Prompt: instrument + action + target in one question (bench figure style)
-  - --prompt-mode mcq: lettered options (A, B, C, …) per category
+  - Prompt: instrument + verb + target in one question (bench figure style)
+  - --prompt-mode mcq: MCQ option lists (--mcq-option-format list|lettered)
   - --prompt-mode ov:  open vocabulary (no option list)
   - Metrics: per-component Accuracy, Triplet Accuracy, per-component mAP
   - Default: evaluate all triplet annotations (--eval-all)
@@ -74,45 +74,98 @@ def cholect_display_label(name: str) -> str:
     return (name or "").strip().replace("_", "-")
 
 
+def _build_name_option_map(options: list[str]) -> dict[str, str]:
+    """Map canonical / display spellings -> canonical option id (no A/B/C letters)."""
+    out: dict[str, str] = {}
+    for opt in options:
+        disp = cholect_display_label(opt)
+        out[_canonical(opt)] = opt
+        out[_canonical(disp)] = opt
+    return out
+
+
+def _format_option_list_block(title: str, options: list[str]) -> tuple[str, dict[str, str]]:
+    """Comma-separated option list only (no A, B, C prefixes)."""
+    labels = [cholect_display_label(o) for o in options if str(o).strip()]
+    line = f"{title}: {', '.join(labels)}"
+    return line, _build_name_option_map(options)
+
+
 def _format_lettered_block(title: str, options: list[str]) -> tuple[str, dict[str, str]]:
-    """Return a lettered option block and map letter / canonical name -> canonical option id."""
+    """Lettered block (A. …, B. …) plus map for letter and name matching."""
     lines = [f"{title}:"]
     letter_to_option: dict[str, str] = {}
-    name_to_option: dict[str, str] = {}
+    name_map = _build_name_option_map(options)
     for i, opt in enumerate(options):
         letter = chr(ord("A") + i)
         disp = cholect_display_label(opt)
         lines.append(f"{letter}. {disp}")
         letter_to_option[letter.upper()] = opt
         letter_to_option[letter.lower()] = opt
-        name_to_option[_canonical(opt)] = opt
-        name_to_option[_canonical(disp)] = opt
-    return "\n".join(lines), {**letter_to_option, **name_to_option}
+    return "\n".join(lines), {**letter_to_option, **name_map}
 
 
-def build_triplet_recognition_prompt(*, prompt_mode: str) -> tuple[str, dict[str, Any]]:
+def _build_output_format_instruction(*, mcq: bool) -> str:
+    """Structured triplet blocks; field names 'instrument' / 'target' / 'verb' highlighted."""
+    lines = [
+        "Answer using the following structure only. "
+        "List every instrument–verb–target triplet you see (one triplet per block). "
+        "Use these field names exactly:",
+        "",
+        "'instrument': <instrument name>",
+        "'target': <anatomical target>",
+        "'verb': <surgical verb>",
+        "",
+        "Example (single triplet):",
+        "'instrument': grasper",
+        "'target': gallbladder",
+        "'verb': grasp",
+        "",
+        "If there are multiple triplets, separate each block with a blank line. "
+        "Do not use bullet numbers or extra prose outside these lines.",
+    ]
+    if mcq:
+        lines.insert(
+            1,
+            "Each value must be chosen from the corresponding 'instrument', 'verb', or 'target' option list below.",
+        )
+    return "\n".join(lines)
+
+
+def build_triplet_recognition_prompt(
+    *,
+    prompt_mode: str,
+    mcq_option_format: str = "list",
+) -> tuple[str, dict[str, Any]]:
     """
     Bench-style single triplet question.
-    MCQ: instrument / action / target option lists with A, B, C, …
+    MCQ: instrument / verb / target option lists (--mcq-option-format).
     OV:  no option lists.
     """
     mode = (prompt_mode or "mcq").strip().lower()
-    meta: dict[str, Any] = {"prompt_mode": mode}
+    opt_fmt = (mcq_option_format or "list").strip().lower()
+    meta: dict[str, Any] = {"prompt_mode": mode, "mcq_option_format": opt_fmt}
 
     core = (
         "What tasks are the instruments accomplishing with the targets in this surgical image? "
-        "There may be more than one instrument-action-target triplet in the frame."
+        "There may be more than one 'instrument'–'verb'–'target' triplet in the frame."
     )
+    output_fmt = _build_output_format_instruction(mcq=(mode == "mcq"))
 
     if mode == "ov":
-        return core, meta
+        body = f"{core}\n\n{output_fmt}"
+        return body, meta
 
     if mode != "mcq":
         raise ValueError(f"Unknown --prompt-mode {prompt_mode!r}; choose mcq or ov.")
 
-    inst_block, inst_map = _format_lettered_block("Instruments", INSTRUMENT_OPTIONS)
-    verb_block, verb_map = _format_lettered_block("Actions (verbs)", VERB_OPTIONS)
-    tgt_block, tgt_map = _format_lettered_block("Targets", TARGET_OPTIONS)
+    if opt_fmt not in ("list", "lettered"):
+        raise ValueError(f"Unknown --mcq-option-format {mcq_option_format!r}; choose list or lettered.")
+
+    fmt_block = _format_option_list_block if opt_fmt == "list" else _format_lettered_block
+    inst_block, inst_map = fmt_block("'instrument' options", INSTRUMENT_OPTIONS)
+    verb_block, verb_map = fmt_block("'verb' options", VERB_OPTIONS)
+    tgt_block, tgt_map = fmt_block("'target' options", TARGET_OPTIONS)
     meta["option_maps"] = {
         "instrument": inst_map,
         "verb": verb_map,
@@ -121,7 +174,8 @@ def build_triplet_recognition_prompt(*, prompt_mode: str) -> tuple[str, dict[str
 
     body = (
         f"{core}\n\n"
-        "The available instrument, action, and target options are:\n\n"
+        f"{output_fmt}\n\n"
+        "The available 'instrument', 'verb', and 'target' options are:\n\n"
         f"{inst_block}\n\n{verb_block}\n\n{tgt_block}"
     )
     return body, meta
@@ -139,7 +193,8 @@ def _split_terms(text: str) -> list[str]:
     for p in parts:
         t = p.strip()
         t = re.sub(r"^[-*•]\s*", "", t)
-        t = re.sub(r"^\d+[.)]\s*", "", t).strip()
+        t = re.sub(r"^\d+[.)]\s*", "", t)
+        t = re.sub(r"^[A-Za-z][.)]\s*", "", t).strip()
         if t:
             out.append(t)
     return out[:3]
@@ -201,13 +256,99 @@ def parse_mcq_terms(text: str, options: list[str]) -> list[str]:
 def _extract_labeled_field(text: str, labels: tuple[str, ...]) -> str | None:
     for lab in labels:
         m = re.search(
-            rf"{re.escape(lab)}\s*[:=]\s*([^\n,;]+)",
+            rf"(?:^|\n)\s*['\"]?{re.escape(lab)}['\"]?\s*[:=]\s*([^\n,;]+)",
             text,
             re.IGNORECASE,
         )
         if m:
-            return m.group(1).strip()
+            val = m.group(1).strip().strip("'\"")
+            return val if val else None
     return None
+
+
+_FIELD_LINE_RE = re.compile(
+    r"^\s*['\"]?(instrument|instruments|target|targets|action|actions|verb|verbs)['\"]?\s*[:=]\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _field_key_to_role(key: str) -> str | None:
+    k = (key or "").strip().lower().rstrip("s")
+    if k in ("instrument",):
+        return "instrument"
+    if k in ("target",):
+        return "target"
+    if k in ("action", "verb"):
+        return "verb"
+    return None
+
+
+def _finalize_labeled_triplet(
+    fields: dict[str, str],
+    *,
+    prompt_mode: str,
+    prompt_meta: dict[str, Any],
+) -> dict[str, str | None] | None:
+    if not fields:
+        return None
+    return _parse_one_triplet_tokens(
+        fields.get("instrument"),
+        fields.get("verb"),
+        fields.get("target"),
+        prompt_mode=prompt_mode,
+        prompt_meta=prompt_meta,
+    )
+
+
+def _parse_labeled_triplet_blocks(
+    raw: str,
+    *,
+    prompt_mode: str,
+    prompt_meta: dict[str, Any],
+) -> list[dict[str, str | None]]:
+    """
+    Parse blocks like:
+      'instrument': grasper
+      'target': gallbladder
+      'verb': grasp
+    """
+    triplets: list[dict[str, str | None]] = []
+    seen: set[tuple[str, str, str]] = set()
+    current: dict[str, str] = {}
+
+    def flush() -> None:
+        nonlocal current
+        if not current:
+            return
+        t = _finalize_labeled_triplet(current, prompt_mode=prompt_mode, prompt_meta=prompt_meta)
+        current = {}
+        if not t or not (t.get("instrument") and t.get("verb") and t.get("target")):
+            return
+        key = (_canonical(t["instrument"]), _canonical(t["verb"]), _canonical(t["target"]))
+        if key in seen:
+            return
+        seen.add(key)
+        triplets.append(t)
+
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s:
+            flush()
+            continue
+        m = _FIELD_LINE_RE.match(s)
+        if m:
+            role = _field_key_to_role(m.group(1))
+            val = m.group(2).strip().strip("'\"")
+            if role and val:
+                if role in current and current[role] != val:
+                    flush()
+                current[role] = val
+            continue
+        if current:
+            flush()
+
+    flush()
+    return triplets
 
 
 def _parse_one_triplet_tokens(
@@ -259,7 +400,11 @@ def _parse_triplet_lines_from_text(
     prompt_mode: str,
     prompt_meta: dict[str, Any],
 ) -> list[dict[str, str | None]]:
-    """Parse zero or more triplets from a free-form response (line / numbered list)."""
+    """Parse zero or more triplets from structured or free-form response."""
+    labeled = _parse_labeled_triplet_blocks(raw, prompt_mode=prompt_mode, prompt_meta=prompt_meta)
+    if labeled:
+        return labeled
+
     triplets: list[dict[str, str | None]] = []
     seen: set[tuple[str, str, str]] = set()
 
@@ -302,7 +447,7 @@ def _parse_triplet_lines_from_text(
         return triplets
 
     inst_tok = _extract_labeled_field(raw, ("instrument", "instruments"))
-    verb_tok = _extract_labeled_field(raw, ("action", "actions", "verb", "verbs"))
+    verb_tok = _extract_labeled_field(raw, ("verb", "verbs", "action", "actions"))
     tgt_tok = _extract_labeled_field(raw, ("target", "targets"))
     if inst_tok or verb_tok or tgt_tok:
         add(_parse_one_triplet_tokens(
@@ -583,6 +728,7 @@ def _make_result_entry(
             "label_context": label_context,
             "eval_protocol": "cholect50_triplet_recognition",
             "prompt_mode": args.prompt_mode,
+            "mcq_option_format": args.mcq_option_format if args.prompt_mode == "mcq" else None,
             "user_prompt": user_prompt,
         },
         "output": None,
@@ -613,7 +759,13 @@ def parse_args() -> argparse.Namespace:
         "--prompt-mode",
         choices=("mcq", "ov"),
         default="mcq",
-        help="mcq: lettered A/B/C option lists; ov: open vocabulary (no options).",
+        help="mcq: option lists in prompt; ov: open vocabulary (no options).",
+    )
+    p.add_argument(
+        "--mcq-option-format",
+        choices=("list", "lettered"),
+        default="list",
+        help="With --prompt-mode mcq: list=comma-separated labels only; lettered=A. B. C. prefixes.",
     )
     p.add_argument(
         "--samples-per-instrument",
@@ -664,11 +816,16 @@ def main() -> None:
             "프레임 이미지 루트를 찾지 못했습니다. --videos-root 또는 CHOLECT50_VIDEOS_ROOT 를 지정해 주세요."
         )
 
-    user_prompt, prompt_meta = build_triplet_recognition_prompt(prompt_mode=args.prompt_mode)
+    user_prompt, prompt_meta = build_triplet_recognition_prompt(
+        prompt_mode=args.prompt_mode,
+        mcq_option_format=args.mcq_option_format,
+    )
 
     model_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", (args.model_name or "original").strip() or "original")
     out_root = args.output_root.resolve()
     mode_slug = args.prompt_mode
+    if args.prompt_mode == "mcq":
+        mode_slug = f"{mode_slug}_{args.mcq_option_format}"
     out_path = (
         args.output.resolve()
         if args.output is not None
@@ -703,7 +860,8 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    print(f"CholecT50 triplet recognition: prompt_mode={args.prompt_mode}.", file=sys.stderr)
+    fmt_note = f", mcq_option_format={args.mcq_option_format}" if args.prompt_mode == "mcq" else ""
+    print(f"CholecT50 triplet recognition: prompt_mode={args.prompt_mode}{fmt_note}.", file=sys.stderr)
 
     model_id = args.model_id or _DEFAULT_MODEL_IDS[args.backend]
     hf_token = args.hf_token.resolve().read_text(encoding="utf-8").strip()
@@ -819,6 +977,7 @@ def main() -> None:
         "model_name": model_name,
         "vlm_load": meta,
         "prompt_mode": args.prompt_mode,
+        "mcq_option_format": args.mcq_option_format if args.prompt_mode == "mcq" else None,
         "user_prompt_template": user_prompt,
         "eval_all": bool(args.eval_all),
         "samples_only": bool(args.samples_only),

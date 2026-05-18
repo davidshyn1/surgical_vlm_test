@@ -19,6 +19,8 @@ export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 : "${GVL_GROOT_DEFAULT:=$VLA_ROOT/GR00T-H/.venv/bin/python}"
 : "${CHOLECT50_CHALLENGE_VAL_ROOT:=$ROOT/../eval/cholect50-challenge-val}"
 : "${CHOLECT50_VIDEOS_ROOT:=}"
+: "${CHOLEC80_ROOT:=$ROOT/../data/Cholec80}"
+: "${CHOLEC80_FRAMES_ROOT:=$ROOT/../eval/cholec80_frames_stride25}"
 
 guess_conda_python() {
   local env_name="$1"
@@ -129,6 +131,11 @@ usage() {
   cat <<'EOF'
 Usage:
   BACKEND=<backend> bash grounding_task.sh triplet_recognition_cholect50 [args...]
+  BACKEND=<backend> bash grounding_task.sh phase_recognition_cholec80 [args...]
+
+Example (Cholec80 phase recognition, eval videos 41–80):
+  BACKEND=prismatic DEVICE_VISIBLE=0 \\
+    bash grounding_task.sh phase_recognition_cholec80 --frame-stride 25 --video 41
 
 Example (full eval, one model load, one VLM call per frame — default):
   CHOLECT50_VIDEOS_ROOT=/path/to/CholecT50/videos \
@@ -144,6 +151,8 @@ Example (full eval, one model load, one VLM call per frame — default):
 Env:
   CHOLECT50_CHALLENGE_VAL_ROOT  default: ../eval/cholect50-challenge-val
   CHOLECT50_VIDEOS_ROOT         frame images (required if not under dataset-root/videos)
+  CHOLEC80_ROOT                 default: ../data/Cholec80 (falls back to ../data/cholec80)
+  CHOLEC80_FRAMES_ROOT          pre-extracted frames (--frames-root); optional
   DEVICE_VISIBLE                -> CUDA_VISIBLE_DEVICES (default 0)
   MODEL_ID                      default --model-id when omitted
   GROUNDING_TASK_AUTO_BACKEND_SETUP=0  skip auto uv install
@@ -168,6 +177,7 @@ shift
 
 case "$task" in
   triplet_recognition_cholect50) script="triplet_recognition_cholect50.py" ;;
+  phase_recognition_cholec80) script="phase_recognition_cholec80.py" ;;
   -h|--help|help) usage; exit 0 ;;
   *)
     echo "ERROR: unknown task '$task'" >&2
@@ -205,6 +215,12 @@ export CUDA_VISIBLE_DEVICES="$DEVICE_VISIBLE"
 if [[ "$task" == "triplet_recognition_cholect50" ]]; then
   ! has_flag "--dataset-root" "$@" && set -- "$@" --dataset-root "$CHOLECT50_CHALLENGE_VAL_ROOT"
   [[ -n "$CHOLECT50_VIDEOS_ROOT" ]] && ! has_flag "--videos-root" "$@" && set -- "$@" --videos-root "$CHOLECT50_VIDEOS_ROOT"
+fi
+
+if [[ "$task" == "phase_recognition_cholec80" ]]; then
+  ! has_flag "--dataset-root" "$@" && set -- "$@" --dataset-root "$CHOLEC80_ROOT"
+  ! has_flag "--split" "$@" && set -- "$@" --split eval
+  [[ -n "$CHOLEC80_FRAMES_ROOT" ]] && ! has_flag "--frames-root" "$@" && set -- "$@" --frames-root "$CHOLEC80_FRAMES_ROOT"
 fi
 
 exec uv run --python "$python_bin" "$script" "$@"
