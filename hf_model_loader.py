@@ -134,6 +134,25 @@ def _is_qwen_vl_model_type(model_type: str) -> bool:
     return "qwen" in mt and "vl" in mt
 
 
+_INTERNVL_PYTHON_DEPS = ("timm", "einops")
+
+
+def _ensure_internvl_deps(model_id: str) -> None:
+    if "internvl" not in model_id.lower():
+        return
+    missing: list[str] = []
+    for pkg in _INTERNVL_PYTHON_DEPS:
+        try:
+            __import__(pkg)
+        except ImportError:
+            missing.append(pkg)
+    if missing:
+        raise ImportError(
+            f"InternVL load requires: {', '.join(missing)}. "
+            f"In your HF_PYTHON env run: pip install {' '.join(missing)}"
+        ) from None
+
+
 def _infer_default_image_side(processor: Any, config: Any) -> int:
     for attr in ("image_processor", "video_processor"):
         proc = getattr(processor, attr, None)
@@ -171,6 +190,7 @@ def load_hf_vlm(
     cache = _hub_cache_dir(cache_dir)
     token = hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
     dtype = _dtype_for_device(device)
+    _ensure_internvl_deps(model_id)
 
     if "GR00T" in model_id.upper() or model_id.strip() in ("nvidia/GR00T-H",):
         ensure_eagle_block2a_bundle()
@@ -239,10 +259,8 @@ def load_hf_vlm(
                 "trust_remote_code": trust_remote_code,
                 "token": token,
             }
-            if loader_cls in (AutoModelForImageTextToText, AutoModelForCausalLM):
-                load_kw["torch_dtype"] = dtype
-            else:
-                load_kw["torch_dtype"] = dtype
+            load_kw["dtype"] = dtype
+            load_kw["torch_dtype"] = dtype  # older transformers
             if device != "auto":
                 load_kw["device_map"] = _device_map_arg(device)
             if _is_qwen_vl_model_type(model_type):

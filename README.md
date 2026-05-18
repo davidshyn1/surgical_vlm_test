@@ -10,9 +10,11 @@ CholecT50 **triplet recognition** · Cholec80 **phase recognition** · EndoVis 2
 | **`prismatic`** | `../backend/prismatic-vlms` + Hub id 또는 로컬 `.pt` + `config.json` | TRI-ML Prismatic 전용 |
 | **`cosmos-*` / `qwen3-*` / `internvl*` / `paligemma*` / `groot`** | Hugging Face Hub → `AutoProcessor` + `AutoModel*` / `Qwen3VL*` → `model.generate()` | 사전학습 VLM **추론(eval)만** (학습 없음) |
 
-- `cosmos-32b` → Hub `nvidia/Cosmos-Reason2-32B` (Qwen3-VL 계열, cosmos-reason2 repo venv **불필요**)
+- `cosmos-32b` → `nvidia/Cosmos-Reason2-32B` (Qwen3-VL 계열; `cosmos-reason2` repo venv **불필요**)
 - `qwen3-4b` / `qwen3-32b` → `Qwen/Qwen3-VL-*-Instruct`
-- 크기별 별칭·기본 id: `backend_registry.py` · 전체 목록은 `python -c "from backend_registry import BACKEND_CHOICES; print(BACKEND_CHOICES)"`
+- `internvl3.5` → `OpenGVLab/InternVL3_5-38B-HF` (**`-HF` 필수**, custom `InternVL3_5-38B` 아님)
+- `paligemma2` → `google/paligemma2-28b-pt-224` (프롬프트 앞 `<image>` 자동 삽입)
+- 크기·Hub id 전체: `backend_registry.py` · `BACKEND_CHOICES` / `DEFAULT_MODEL_IDS`
 
 ---
 
@@ -203,9 +205,35 @@ bash setup_backend.sh prismatic    # 하나만
 백엔드 repo 기본 경로: `surgical/../backend` (`VLA_ROOT_OVERRIDE`로 변경 가능)
 
 - **prismatic**: `prismatic-vlms/.venv` (`bash setup_backend.sh prismatic`)
-- **HF 모델**: `HF_PYTHON`으로 transformers가 설치된 인터프리터 지정 (conda `surgical` 등). 별도 `cosmos-reason2` / `GR00T-H` repo venv는 **필수 아님**.
+- **HF 모델**: `HF_PYTHON`으로 transformers가 설치된 인터프리터 지정 (conda `appgen`, `surgical` 등). 별도 `cosmos-reason2` / `GR00T-H` repo venv는 **필수 아님**.
 
-### 3.4 HF 모델 캐시 (가중치)
+### 3.4 HF Python 환경 (의존성)
+
+`grounding_task.sh`는 `HF_PYTHON`이 없으면 conda `appgen` → `surgical` 순으로 탐색합니다.
+
+**공통 (대부분의 HF VLM)**
+
+```bash
+export HF_PYTHON=/path/to/your/env/bin/python
+$HF_PYTHON -m pip install torch transformers accelerate pillow
+```
+
+**모델군별 추가 패키지**
+
+| 백엔드 | 추가 `pip install` | 비고 |
+|--------|-------------------|------|
+| `internvl` / `internvl3.5` | `timm` `einops` | `transformers>=4.52.1` 권장; 38B는 VRAM 큼 (A100×2 수준) |
+| `paligemma2` | (없음) | chat template 없음 → `processor(text, images)` 경로; MCQ 품질은 **mix/instruct** checkpoint 권장 |
+| `groot` | `gr00t` 패키지 (`../backend/GR00T-H`) | Eagle 번들 자동 보정 (`hf_model_loader`) |
+| `cosmos-*` / `qwen3-*` | Qwen3-VL 지원 transformers | bbox localization 시 0–1000 → ÷1000 파싱 |
+
+**HF_PYTHON 고정 예**
+
+```bash
+export HF_PYTHON=/NHNHOME/WORKSPACE/26msit001_T_B/KAIST-AIPRLab/.conda/envs/appgen/bin/python
+```
+
+### 3.5 HF 모델 캐시 (가중치)
 
 스크립트는 **체크포인트를 새로 저장하지 않습니다.** Hub에서 받은 가중치는 `grounding_task.sh`가 설정하는 캐시에만 쌓입니다.
 
@@ -213,31 +241,49 @@ bash setup_backend.sh prismatic    # 하나만
 |------|-----------|
 | `HF_HOME` | `<surgical repo>/.cache/huggingface/` |
 | **`HF_HUB_CACHE` (가중치)** | **`<surgical repo>/.cache/huggingface/hub/`** |
-| Hub 스냅샷 예 | `.../hub/models--nvidia--Cosmos-Reason2-32B/` |
+| Hub 스냅샷 예 | `.../hub/models--google--paligemma2-28b-pt-224/` |
 
-`hf_model_loader.py` import 시 위 경로로 env를 고정합니다 (`configure_hf_cache()`).  
-`grounding_task.sh`도 동일 경로를 export합니다. 다른 위치를 쓰려면 실행 전 `export HF_HUB_CACHE=/your/path` 로 override.
+`hf_model_loader.py` import 시 `configure_hf_cache()`로 env를 고정합니다.  
+`grounding_task.sh`도 `HF_HUB_CACHE=$ROOT/../.cache/huggingface/hub` 를 export합니다.
 
-### 3.5 기본 Hub model-id · 출력 slug
+> **레거시 캐시:** 예전에 `.../.cache/huggingface/models--*` ( **`hub/` 밖 상위 폴더** )에 받은 가중치가 있을 수 있습니다.  
+> 새 설정은 `hub/` 를 우선합니다. 상위에만 있는 모델은 `hub/` 로 symlink 하거나 `export HF_HUB_CACHE` 를 상위로 맞추세요.
 
-| `--backend` | Hub `--model-id` | 출력 폴더 slug (`--model-name` 기본) |
-|-------------|------------------|----------------------|
+### 3.6 기본 Hub model-id · 출력 slug
+
+| `--backend` | Hub `--model-id` (기본) | 출력 slug (`--model-name` 기본) |
+|-------------|-------------------------|--------------------------------|
 | `prismatic` | `prism-dinosiglip+7b` | `prismatic-7b` |
 | `cosmos` / `cosmos-2b` | `nvidia/Cosmos-Reason2-2B` | `cosmos-reason2-2b` |
 | `cosmos-32b` | `nvidia/Cosmos-Reason2-32B` | `cosmos-reason2-32b` |
 | `qwen3` / `qwen3-4b` | `Qwen/Qwen3-VL-4B-Instruct` | `qwen3-vl-4b` |
 | `qwen3-32b` | `Qwen/Qwen3-VL-32B-Instruct` | `qwen3-vl-32b` |
-| `qwen2.5` | `Qwen/Qwen2.5-VL-7B-Instruct` | `qwen2.5-vl-7b` |
-| `internvl3.5` | `OpenGVLab/InternVL3_5-8B-HF` | `internvl3.5-8b` |
-| `paligemma2` | `google/paligemma2-10b-pt-224` | `paligemma2-10b` |
+| `qwen2.5` | `Qwen/Qwen2.5-VL-32B-Instruct` | `qwen2.5-vl-32b` |
+| `internvl` / `internvl3.5` | `OpenGVLab/InternVL3_5-38B-HF` | `internvl3.5-38b` |
+| `paligemma` / `paligemma2` | `google/paligemma2-28b-pt-224` | `paligemma2-28b` |
 | `groot` | `nvidia/GR00T-H` | `groot-h` |
 
-별칭: `BACKEND=cosmos2b` → `cosmos-2b`, `BACKEND=qwen3_32b` → `qwen3-32b` (하이픈/언더스코어 혼용 가능).
+별칭: `BACKEND=cosmos2b` → `cosmos-2b`, `BACKEND=qwen3_32b` → `qwen3-32b`.
+
+**InternVL:** Hub id에 **`-HF` suffix** 가 있는 transformers 표준 checkpoint만 `AutoProcessor` 경로와 호환됩니다.  
+`OpenGVLab/InternVL3_5-38B`(HF 없음)는 OpenGVLab `internvl_chat` 코드용입니다.
+
+**PaliGemma:** `*-pt-224` 는 pretrain; triplet MCQ에는 `google/paligemma2-10b-mix-448` 등 **mix/instruct** 를 `--model-id`로 지정하는 것을 권장합니다.
 
 `--model-id`로 Hub id, `--model-name`으로 **결과 JSON이 들어가는 하위 폴더 이름**만 바꿀 수 있습니다.  
 환경 변수 `MODEL_ID`, `MODEL_NAME`도 `grounding_task.sh`에서 동일하게 주입됩니다.
 
-### 3.6 Cholec80 eval frame 준비 (최초 1회)
+### 3.7 HF 추론 경로 (`backends.HfAutoBackend`)
+
+| 모델군 | 입력 조립 |
+|--------|-----------|
+| Qwen-VL, Cosmos, InternVL `-HF` | `processor.apply_chat_template` (user + image) |
+| PaliGemma 등 template 없음 | `processor(text="<image>\n" + prompt, images=...)` |
+| Prismatic | `PurePromptBuilder` + `prismatic.generate` |
+
+공통: 프레임 square resize → `model.generate` → 태스크 파서 → `outputs/...json` (resume 지원).
+
+### 3.8 Cholec80 eval frame 준비 (최초 1회)
 
 `extract_cholec80_frames.sh`는 비디오당 **ffmpeg 1회** 디코드로 0.1 fps PNG를 뽑고, 같은 폴더에 `videoNN-phase.txt`를 씁니다.
 
@@ -265,13 +311,6 @@ bash grounding_task.sh phase_recognition_cholec80
 # MP4에서 직접 (추출본 없을 때만)
 bash grounding_task.sh phase_recognition_cholec80 --frame-stride 250
 ```
-
-**추론 파이프라인 (HF 백엔드, 예: `cosmos-32b`)**
-
-1. `load_backend("cosmos-32b")` → `nvidia/Cosmos-Reason2-32B` 로드 (`hf_model_loader.load_hf_vlm`)
-2. 프레임 PIL → square resize (`pil_side`, 보통 384)
-3. 태스크별 user prompt 조립 → `HfAutoBackend.generate()` (`apply_chat_template` + `model.generate`)
-4. 응답 파싱 → GT와 비교 → `outputs/.../*.json`에 append (resume 지원)
 
 ---
 
@@ -337,12 +376,28 @@ BACKEND=qwen3-4b HF_PYTHON=/path/to/python DEVICE_VISIBLE=0 \
 BACKEND=qwen3-32b HF_PYTHON=/path/to/python DEVICE_VISIBLE=0 \
   bash grounding_task.sh triplet_recognition_cholect50 --eval-protocol joint --max-samples 5
 
-# Cosmos-Reason2 2B / 32B (HF_PYTHON 생략 시 conda surgical 등 자동 탐색)
+# Cosmos-Reason2 2B / 32B
 BACKEND=cosmos-2b DEVICE_VISIBLE=0 bash grounding_task.sh phase_recognition_cholec80 --video 41
 BACKEND=cosmos-32b DEVICE_VISIBLE=0 bash grounding_task.sh phase_recognition_cholec80 --video 41 --max-frames-per-video 5
+
+# InternVL3.5 38B (HF) — timm/einops 필요, GPU 1장이면 OOM 가능
+export HF_PYTHON=/path/to/env/bin/python
+$HF_PYTHON -m pip install timm einops
+BACKEND=internvl3.5 DEVICE_VISIBLE=1 \
+  bash grounding_task.sh triplet_recognition_cholect50 \
+    --eval-protocol sequential_gt --prompt-mode mcq --video VID68
+
+# PaliGemma2 28B (로컬 캐시 있으면 hub에서 재다운로드 없음)
+BACKEND=paligemma2 DEVICE_VISIBLE=0 \
+  bash grounding_task.sh triplet_recognition_cholect50 \
+    --eval-protocol sequential_gt --prompt-mode mcq --eval-all
+
+# PaliGemma instruct/mix (품질 권장)
+BACKEND=paligemma2 MODEL_ID=google/paligemma2-10b-mix-448 DEVICE_VISIBLE=0 \
+  bash grounding_task.sh triplet_recognition_cholect50 --eval-protocol joint --max-samples 10
 ```
 
-> **주의:** `DEVICE_VISIBLE`(GPU index) 철자를 맞출 것. `DEVISE_VISIBLE` 등 오타 시 GPU가 고정되지 않습니다.
+> **주의:** `DEVICE_VISIBLE`(GPU index) 철자를 맞출 것 (`DEVISE_VISIBLE` 아님).
 
 #### Cholec80 phase
 
@@ -529,15 +584,23 @@ outputs/triplet_recognition_cholect50/
     cholect50_challenge_val_triplet.json
 ```
 
-**예시 (phase, cosmos-32b, video 41 스모크):**
+**예시 (InternVL3.5 38B, triplet sequential_gt):**
 
 ```
-outputs/phase_recognition_cholec80/
-  phase_cosmos-32b_cosmos-reason2-32b_eval/
-    cholec80_phase_0p1fps_manifest.json
+outputs/triplet_recognition_cholect50/
+  triplet_internvl3.5_internvl3.5-38b_mcq_sequential_gt/
+    cholect50_challenge_val_triplet.json
 ```
 
-`--output` / `--output-root`로 경로 override 가능. 동일 JSON 경로로 재실행하면 **resume** (완료된 row 스킵); `--force`로 전부 재추론.
+**예시 (PaliGemma2 28B):**
+
+```
+outputs/triplet_recognition_cholect50/
+  triplet_paligemma2_paligemma2-28b_mcq_sequential_gt/
+    cholect50_challenge_val_triplet.json
+```
+
+`--output` / `--output-root`로 경로 override. 동일 JSON으로 재실행 시 **resume**; `--force`로 전부 재추론.
 
 JSON 필드 요약:
 
@@ -557,7 +620,8 @@ JSON 필드 요약:
 | `DEVICE_VISIBLE` | → `CUDA_VISIBLE_DEVICES` (기본 `0`). **철자 주의** (`DEVISE_VISIBLE` 아님) |
 | `MODEL_ID` | `--model-id` 자동 주입 (Hub repo id) |
 | `MODEL_NAME` | `--model-name` 자동 주입 (출력 하위 폴더 slug) |
-| `HF_HOME` / `HF_HUB_CACHE` | Hub 가중치 캐시 (기본: `../.cache/huggingface`) |
+| `HF_HOME` | 기본 `../.cache/huggingface` |
+| `HF_HUB_CACHE` | 기본 `../.cache/huggingface/hub` (가중치 스냅샷) |
 | `CHOLECT50_CHALLENGE_VAL_ROOT` | triplet `--dataset-root` (기본: `../eval/cholect50-challenge-val`) |
 | `CHOLECT50_VIDEOS_ROOT` | triplet `--videos-root` |
 | `CHOLEC80_ROOT` | phase `--dataset-root` (기본: `../data/Cholec80`, `cholec80` 폴백) |
@@ -592,9 +656,14 @@ JSON 필드 요약:
 3. **Cholec80 eval frame 없음** — `../eval/cholec80/frames_0p1fps/video41/000000.png` 및 `video41-phase.txt` 확인; 없으면 `bash scripts/extract_cholec80_frames.sh`  
 4. **프레임 로드 실패** — eval PNG 경로·파일명(`{frame:06d}.png`)이 manifest `Frame`과 일치하는지 확인; MP4 fallback은 `ffmpeg` 필요  
 5. **백엔드 import 실패** — prismatic: `bash setup_backend.sh prismatic` / HF: `HF_PYTHON`에 `torch`, `transformers` 확인  
-5b. **`TypeError: torch.device is not iterable`** — `hf_model_loader`가 `resolve_device()`의 `torch.device`를 처리하도록 수정됨. 최신 `hf_model_loader.py` 사용  
+5a. **InternVL `No module named timm`** — `pip install timm einops` in `HF_PYTHON` env  
+5b. **InternVL wrong checkpoint** — `MODEL_ID=OpenGVLab/InternVL3_5-38B-HF` (`-HF` suffix). non-HF `InternVL3_5-38B`는 custom 포맷  
+5c. **`apply_chat_template` / no chat template** — PaliGemma: 최신 `backends.py`가 `<image>` prefix + `processor(text, images)` fallback 사용  
+5d. **PaliGemma `<image>` warning** — 동일; 프롬프트 앞 `<image>` 자동 추가됨 (재실행 시 최신 코드 필요)  
+5e. **`TypeError: torch.device is not iterable`** — 최신 `hf_model_loader.py` 사용 (`torch.device` 지원)  
 6. **HF 401** — `.hf_token` 경로 및 권한  
-6b. **32B OOM** — `cosmos-32b` / `qwen3-32b`는 VRAM 많이 필요; 스모크는 `--max-samples` / `--max-frames-per-video` / `--video`로 축소  
+6b. **32B / 38B OOM** — `cosmos-32b`, `qwen3-32b`, `internvl3.5`는 VRAM 큼; `--video`, `--max-samples`, `--max-frames-per-video`로 축소  
+6c. **캐시를 못 찾고 재다운로드** — 가중치가 `.../huggingface/models--*`(상위)에만 있으면 `hub/`로 symlink 또는 `HF_HUB_CACHE` 조정 (§3.5)  
 7. **resume** — 동일 `--output` JSON에 이어서 실행; 전체 재실행은 `--force`  
 8. **triplet sequential이 느림** — annotation당 VLM 3회; 빠른 테스트는 `--eval-protocol joint` 또는 `--samples-only`  
 9. **phase eval이 너무 느림** — 기본 `../eval/cholec80/frames_0p1fps`(0.1 fps, ~9.8k calls); 25 fps는 `--frame-stride 1`  

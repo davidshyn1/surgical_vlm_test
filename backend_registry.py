@@ -39,12 +39,12 @@ DEFAULT_MODEL_IDS: dict[str, str] = {
     "qwen3": "Qwen/Qwen3-VL-4B-Instruct",
     "qwen3-4b": "Qwen/Qwen3-VL-4B-Instruct",
     "qwen3-32b": "Qwen/Qwen3-VL-32B-Instruct",
-    "qwen2.5": "Qwen/Qwen2.5-VL-7B-Instruct",
-    # InternVL / PaliGemma / GR00T
-    "internvl": "OpenGVLab/InternVL3_5-8B-HF",
-    "internvl3.5": "OpenGVLab/InternVL3_5-8B-HF",
-    "paligemma": "google/paligemma2-10b-pt-224",
-    "paligemma2": "google/paligemma2-10b-pt-224",
+    "qwen2.5": "Qwen/Qwen2.5-VL-32B-Instruct",
+    # InternVL (use *-HF for transformers AutoProcessor; non-HF is OpenGVLab custom format)
+    "internvl": "OpenGVLab/InternVL3_5-38B-HF",
+    "internvl3.5": "OpenGVLab/InternVL3_5-38B-HF",
+    "paligemma": "google/paligemma2-28b-pt-224",
+    "paligemma2": "google/paligemma2-28b-pt-224",
     "groot": "nvidia/GR00T-H",
 }
 
@@ -60,10 +60,10 @@ BACKEND_OUTPUT_SLUGS: dict[str, str] = {
     "qwen3-4b": "qwen3-vl-4b",
     "qwen3-32b": "qwen3-vl-32b",
     "qwen2.5": "qwen2.5-vl-7b",
-    "internvl": "internvl3.5-8b",
-    "internvl3.5": "internvl3.5-8b",
-    "paligemma": "paligemma2-10b",
-    "paligemma2": "paligemma2-10b",
+    "internvl": "internvl3.5-38b",
+    "internvl3.5": "internvl3.5-38b",
+    "paligemma": "paligemma2-28b",
+    "paligemma2": "paligemma2-28b",
     "groot": "groot-h",
 }
 
