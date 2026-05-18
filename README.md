@@ -1,7 +1,7 @@
 # surgical_vlm_test
 
-CholecT50 **triplet recognition** · Cholec80 **phase recognition** 벤치를 위한 독립 패키지입니다.  
-`surgical_vlm_grounding`과 분리되어 있으며, bbox/localization/visualization은 사용하지 않습니다.
+CholecT50 **triplet recognition** · Cholec80 **phase recognition** · EndoVis-17 **instrument localization** 벤치를 위한 독립 패키지입니다.  
+`surgical_vlm_grounding`과 분리되어 있으며, CholecT50/80은 분류·인식 중심이고 EndoVis-17만 bbox 출력·시각화를 사용합니다.
 
 백엔드: `prismatic` · `cosmos` · `groot` (`backends.py`)
 
@@ -13,9 +13,11 @@ CholecT50 **triplet recognition** · Cholec80 **phase recognition** 벤치를 �
 |------|------|
 | `triplet_recognition_cholect50.py` | CholecT50 triplet 평가 |
 | `phase_recognition_cholec80.py` | Cholec80 phase 평가 |
+| `instrument_localization_endovis17.py` | EndoVis-17-VQLA instrument bbox localization |
+| `endovis17_data.py` | EndoVis-17 `vqla/*.txt` 샘플·프롬프트 로딩 |
 | `cholect50_data.py` | challenge-val 라벨·프레임 로딩 |
 | `cholec80_data.py` | Cholec80 phase 라벨·비디오 프레임 로딩 |
-| `utils.py` | 라벨 파싱, resume, 공통 상수 |
+| `utils.py` | 라벨 파싱, bbox/IoU/mAP, resume, 시각화 |
 | `backends.py` | VLM 로드·추론 |
 | `grounding_task.sh` | 실행 런처 (`uv` + 백엔드 venv) |
 | `setup_backend.sh` | 백엔드 `.venv` 설치 (uv) |
@@ -103,6 +105,31 @@ Cholec80은 **전 비디오 25 fps**이며, phase annotation은 **매 프레임*
 
 실행 예시는 **§4.1 Cholec80 phase**를 참고하세요.
 
+### EndoVis-17 Instrument Localization
+
+**Instrument localization** — EndoVis-17-VQLA `Where is {instrument} located?` 질의에 대해 bbox를 예측합니다.
+
+- **데이터**: `<surgical repo>/eval/EndoVis-17-VQLA` (`left_frames/`, `vqla/*.txt`)
+- **이미지**: 1280×1024 JPEG (원본). VLM 입력은 backend `pil_side`로 square resize (예: 384×384)
+- **프롬프트** (instrument 이름이 샘플마다 치환됨):
+
+```
+Where is the Large Needle Driver located? Answer the question with just a bounding box.
+Format: [x_min, y_min, x_max, y_max]
+Use normalized coordinates in [0, 1] relative to the image you see.
+If the Large Needle Driver is not in the image, answer exactly: not present
+```
+
+- **GT bbox**: annotation 픽셀 좌표 → 원본 W/H 기준 normalized xyxy 저장
+- **Cosmos**: 모델 출력이 0–1000 스케일이면 파서에서 **÷1000** 후 [0,1]로 metric 계산
+- **지표** (`metrics` in JSON): **mIoU**, **mAP@50**, **mAP@75**, **COCO AP** (IoU 0.5:0.05:0.95)
+- **시각화** (기본 `--viz`): `visualizations/gt/`, `pred/`, `comparison/` — 박스 위·좌상단에 **instrument 이름만** 표시
+
+5종 instrument: Bipolar Forceps, Large Needle Driver, Monopolar Curved Scissors, Prograsp Forceps, Ultrasound Probe.  
+전체 localization 쿼리 **236개** (`Where is … located?` 행만 사용).
+
+실행 예시는 **§4.1 EndoVis-17 localization**을 참고하세요.
+
 ---
 
 ## 3. 사전 준비
@@ -119,6 +146,12 @@ Cholec80은 **전 비디오 25 fps**이며, phase annotation은 **매 프레임*
 - 루트: `<surgical repo>/data/cholec80` (`CHOLEC80_ROOT` 또는 `--dataset-root`)
 - `videos/videoNN.mp4`, `phase_annotations/videoNN-phase.txt`
 - 평가 기본: video **41–80**
+
+**EndoVis-17 (localization)**
+
+- 루트: `<surgical repo>/eval/EndoVis-17-VQLA` (`ENDOVIS17_VQLA_ROOT`)
+- 프레임: `left_frames/{seq}_frame{NNN}.jpg`
+- 질의·GT: `vqla/{stem}.txt` (`question|region|xmin,ymin,xmax,ymax`)
 
 ### 3.2 HF 토큰
 
@@ -247,6 +280,41 @@ bash grounding_task.sh phase_recognition_cholec80 --frame-stride 1
 bash grounding_task.sh phase_recognition_cholec80 --split train
 ```
 
+#### EndoVis-17 localization
+
+`grounding_task.sh`가 기본으로 `--dataset-root`, `--frames-root`, `--annotations-root`를 `../eval/EndoVis-17-VQLA` 하위로 넣습니다.
+
+**스모크 테스트** (5 samples):
+
+```bash
+BACKEND=prismatic DEVICE_VISIBLE=0 \
+  bash grounding_task.sh instrument_localization_endovis17 --max-samples 5
+```
+
+**전체 236 queries**:
+
+```bash
+BACKEND=prismatic DEVICE_VISIBLE=0 \
+  bash grounding_task.sh instrument_localization_endovis17
+```
+
+**Cosmos** (bbox ÷1000 파싱):
+
+```bash
+BACKEND=cosmos MODEL_ID=nvidia/Cosmos-Reason2-2B DEVICE_VISIBLE=0 \
+  bash grounding_task.sh instrument_localization_endovis17
+```
+
+**시각화만 재생성** (기존 JSON 필요):
+
+```bash
+bash grounding_task.sh instrument_localization_endovis17 \
+  --viz-only --force \
+  --output outputs/instrument_localization_endovis17/loc_prismatic_original/endovis17_instrument_localization.json
+```
+
+**시각화 끄기**: `--no-viz`
+
 ### 4.2 Python 직접 실행
 
 **CholecT50**:
@@ -270,6 +338,15 @@ uv run --python ../backend/prismatic-vlms/.venv/bin/python \
   --dataset-root ../data/cholec80 \
   --split eval \
   --frames-root ../data/cholec80/frames_0p1fps
+```
+
+**EndoVis-17**:
+
+```bash
+uv run --python ../backend/prismatic-vlms/.venv/bin/python \
+  instrument_localization_endovis17.py \
+  --backend prismatic \
+  --dataset-root ../eval/EndoVis-17-VQLA
 ```
 
 ### 4.3 주요 CLI 인자
@@ -302,6 +379,19 @@ uv run --python ../backend/prismatic-vlms/.venv/bin/python \
 | `--dataset-root` | Cholec80 루트 (기본: `../data/Cholec80`, `cholec80` 폴백) |
 | `--force` / `--output` | triplet과 동일 |
 
+**EndoVis-17 (`instrument_localization_endovis17.py`)**
+
+| 인자 | 설명 |
+|------|------|
+| `--dataset-root` | EndoVis-17-VQLA 루트 (기본: `../eval/EndoVis-17-VQLA`) |
+| `--frames-root` | `left_frames/` (기본: dataset-root/left_frames) |
+| `--annotations-root` | `vqla/` (기본: dataset-root/vqla) |
+| `--instrument`, `--region`, `--frame` | 필터 (instrument id, region id, frame stem) |
+| `--max-samples N` | 랜덤 subsample (디버그; 생략 시 236개 전체) |
+| `--viz` / `--no-viz` | GT/Pred/comparison JPEG (기본: viz 켜짐) |
+| `--viz-only` | VLM 생략, 기존 JSON에서 시각화만 생성 (`--output` 필수) |
+| `--force` / `--output` | resume·재추론·결과 경로 |
+
 **공통**: `--backend`, `--model-id`, `--device`, `--hf-token`, `--max-new-tokens`
 
 ### 4.4 기본 출력 경로
@@ -310,6 +400,27 @@ uv run --python ../backend/prismatic-vlms/.venv/bin/python \
 |--------|----------------|
 | Triplet | `outputs/triplet_recognition_cholect50/triplet_{backend}_{model}_{mcq\|ov}_{joint\|sequential_*}/cholect50_challenge_val_triplet.json` |
 | Phase | `outputs/phase_recognition_cholec80/phase_{backend}_{model}_{split}/cholec80_phase_stride{N}.json` |
+| EndoVis-17 | `outputs/instrument_localization_endovis17/loc_{backend}_{model}/endovis17_instrument_localization.json` |
+
+EndoVis-17 시각화 (같은 폴더):
+
+```
+loc_{backend}_{model}/
+  endovis17_instrument_localization.json
+  visualizations/
+    gt/          {frame}_{instrument}_{region}_gt.jpg
+    pred/        ..._pred.jpg
+    comparison/  ..._gt_pred.jpg   # GT=green, Pred=red, IoU
+```
+
+JSON `results[]` 항목 요약:
+
+- `input.label_context`: GT bbox (`label_bbox_xyxy_px`, `label_bbox_xyxy_norm`), instrument/region
+- `output.parsed`: `bbox_xyxy_norm`, `bbox_xyxy_px`, `not_present`, `raw` model text
+- `evaluation`: `iou`, `gt_bbox_norm`, `pred_bbox_norm`
+- `visualization_*_path`: 생성된 JPEG 경로
+
+JSON `metrics` (EndoVis-17): `mIoU`, `mAP@50`, `mAP@75`, `COCO_AP`, `per_class_ap`, `n_parsed_bbox`, `n_not_present`.
 
 JSON `output` (triplet `sequential_*`): `parsed.triplets` + `sequential_steps` (단계별 prompt/text/parsed).  
 JSON `metrics` (phase): `accuracy`, `macro_recall`, `macro_precision`, `macro_jaccard`, `per_class`.
@@ -327,6 +438,7 @@ JSON `metrics` (phase): `accuracy`, `macro_recall`, `macro_precision`, `macro_ja
 | `CHOLECT50_VIDEOS_ROOT` | triplet `--videos-root` |
 | `CHOLEC80_ROOT` | phase `--dataset-root` (기본: `../data/Cholec80`, 없으면 `../data/cholec80`) |
 | `CHOLEC80_FRAMES_ROOT` | phase `--frames-root` (추출 PNG 루트, 선택) |
+| `ENDOVIS17_VQLA_ROOT` | localization `--dataset-root` (기본: `../eval/EndoVis-17-VQLA`) |
 | `PRISMATIC_PYTHON` / `COSMOS_PYTHON` / `GROOT_PYTHON` | venv python 경로 override |
 | `GROUNDING_TASK_AUTO_BACKEND_SETUP` | `0`이면 uv 자동 설치 스킵 |
 
@@ -336,10 +448,11 @@ JSON `metrics` (phase): `accuracy`, `macro_recall`, `macro_precision`, `macro_ja
 
 | | **surgical_vlm_test** | **surgical_vlm_grounding** |
 |---|------------------------|------------------------------|
-| 목적 | CholecT50 triplet · Cholec80 phase VLM eval | Localization, language/visual grounding 등 |
+| 목적 | CholecT50 triplet · Cholec80 phase · EndoVis-17 bbox eval | Localization, language/visual grounding 등 |
 | CholecT50 | `triplet_recognition_cholect50.py` | `localization_cholect50.py`, `language_grounding_v*`, … |
 | Cholec80 | `phase_recognition_cholec80.py` | (별도 phase 스크립트 없음) |
-| Bbox | 사용 안 함 | localization 등에서 사용 |
+| EndoVis-17 | `instrument_localization_endovis17.py` | (동일 벤치, 다른 패키지) |
+| Bbox | EndoVis-17만 (normalized xyxy + viz) | CholecT50 localization 등 |
 | 입력 | T50: 추출 프레임 / C80: MP4·추출 PNG | 주로 추출 프레임 |
 | Triplet | `joint` 1질문/프레임 또는 `sequential_*` 3질문/annotation | multi-step localization |
 | Phase | 7-class MCQ (A–G) | localization + phase |
@@ -357,10 +470,14 @@ JSON `metrics` (phase): `accuracy`, `macro_recall`, `macro_precision`, `macro_ja
 6. **resume** — 동일 `--output` JSON에 이어서 실행; 전체 재실행은 `--force`  
 7. **triplet sequential이 느림** — annotation당 VLM 3회; 빠른 테스트는 `--eval-protocol joint` 또는 `--samples-only`  
 8. **phase eval이 너무 느림** — 기본 `frames_0p1fps`(0.1 fps); `--frame-stride 1`은 eval 40 videos 기준 약 98k+ calls  
-9. **프롬프트/프로토콜 변경 후** — 이전 JSON과 혼동 방지를 위해 `--force` 권장
+9. **프롬프트/프로토콜 변경 후** — 이전 JSON과 혼동 방지를 위해 `--force` 권장  
+10. **EndoVis-17 데이터 없음** — `eval/EndoVis-17-VQLA/left_frames`, `vqla/` 확인  
+11. **Cosmos bbox 이상** — 0–1000 출력은 자동 ÷1000; [0,1]로 직접 내면 그대로 사용  
+12. **EndoVis viz만 다시** — `--viz-only --output <기존 json>` (`--force`로 JPEG 덮어쓰기)
 
 ```bash
 python triplet_recognition_cholect50.py --help
 python phase_recognition_cholec80.py --help
+python instrument_localization_endovis17.py --help
 bash grounding_task.sh help
 ```

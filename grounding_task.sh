@@ -20,7 +20,8 @@ export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 : "${CHOLECT50_CHALLENGE_VAL_ROOT:=$ROOT/../eval/cholect50-challenge-val}"
 : "${CHOLECT50_VIDEOS_ROOT:=}"
 : "${CHOLEC80_ROOT:=$ROOT/../data/Cholec80}"
-: "${CHOLEC80_FRAMES_ROOT:=$CHOLEC80_ROOT/frames_0p1fps}"
+: "${CHOLEC80_FRAMES_ROOT:=$ROOT/../eval/cholec80/frames_0p1fps}"
+: "${ENDOVIS17_VQLA_ROOT:=$ROOT/../eval/EndoVis-17-VQLA}"
 
 guess_conda_python() {
   local env_name="$1"
@@ -132,6 +133,11 @@ usage() {
 Usage:
   BACKEND=<backend> bash grounding_task.sh triplet_recognition_cholect50 [args...]
   BACKEND=<backend> bash grounding_task.sh phase_recognition_cholec80 [args...]
+  BACKEND=<backend> bash grounding_task.sh instrument_localization_endovis17 [args...]
+
+Example (EndoVis-17 instrument localization, full 236 queries):
+  BACKEND=prismatic DEVICE_VISIBLE=0 \\
+    bash grounding_task.sh instrument_localization_endovis17 --max-samples 5
 
 Example (Cholec80 phase recognition, eval videos 41–80):
   BACKEND=prismatic DEVICE_VISIBLE=0 \\
@@ -152,7 +158,8 @@ Env:
   CHOLECT50_CHALLENGE_VAL_ROOT  default: ../eval/cholect50-challenge-val
   CHOLECT50_VIDEOS_ROOT         frame images (required if not under dataset-root/videos)
   CHOLEC80_ROOT                 default: ../data/Cholec80 (falls back to ../data/cholec80)
-  CHOLEC80_FRAMES_ROOT          0.1 fps frames + phase manifests (default: $CHOLEC80_ROOT/frames_0p1fps)
+  CHOLEC80_FRAMES_ROOT          0.1 fps frames (default: ../eval/cholec80/frames_0p1fps)
+  ENDOVIS17_VQLA_ROOT           default: ../eval/EndoVis-17-VQLA
   DEVICE_VISIBLE                -> CUDA_VISIBLE_DEVICES (default 0)
   MODEL_ID                      default --model-id when omitted
   GROUNDING_TASK_AUTO_BACKEND_SETUP=0  skip auto uv install
@@ -178,6 +185,7 @@ shift
 case "$task" in
   triplet_recognition_cholect50) script="triplet_recognition_cholect50.py" ;;
   phase_recognition_cholec80) script="phase_recognition_cholec80.py" ;;
+  instrument_localization_endovis17) script="instrument_localization_endovis17.py" ;;
   -h|--help|help) usage; exit 0 ;;
   *)
     echo "ERROR: unknown task '$task'" >&2
@@ -221,6 +229,12 @@ if [[ "$task" == "phase_recognition_cholec80" ]]; then
   ! has_flag "--dataset-root" "$@" && set -- "$@" --dataset-root "$CHOLEC80_ROOT"
   ! has_flag "--split" "$@" && set -- "$@" --split eval
   [[ -n "$CHOLEC80_FRAMES_ROOT" ]] && ! has_flag "--frames-root" "$@" && set -- "$@" --frames-root "$CHOLEC80_FRAMES_ROOT"
+fi
+
+if [[ "$task" == "instrument_localization_endovis17" ]]; then
+  ! has_flag "--dataset-root" "$@" && set -- "$@" --dataset-root "$ENDOVIS17_VQLA_ROOT"
+  ! has_flag "--frames-root" "$@" && set -- "$@" --frames-root "$ENDOVIS17_VQLA_ROOT/left_frames"
+  ! has_flag "--annotations-root" "$@" && set -- "$@" --annotations-root "$ENDOVIS17_VQLA_ROOT/vqla"
 fi
 
 exec uv run --python "$python_bin" "$script" "$@"

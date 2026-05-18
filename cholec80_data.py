@@ -68,6 +68,8 @@ CHOLEC80_VIDEO_FPS = 25
 CHOLEC80_EVAL_FPS = 0.1
 CHOLEC80_EVAL_FRAME_STRIDE = int(round(CHOLEC80_VIDEO_FPS / CHOLEC80_EVAL_FPS))
 CHOLEC80_EVAL_FRAMES_DIRNAME = "frames_0p1fps"
+# Relative to surgical_vlm_test/ (same as $ROOT/../eval/cholec80/frames_0p1fps in shell).
+CHOLEC80_EVAL_FRAMES_RELPATH = Path("../eval/cholec80") / CHOLEC80_EVAL_FRAMES_DIRNAME
 CHOLEC80_EVAL_PHASE_FILENAME_SUFFIX = "-phase.txt"
 
 _IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
@@ -127,8 +129,54 @@ def video_in_split(vid_num: int, split: str) -> bool:
     raise ValueError(f"Unknown split {split!r}; use eval, train, or all.")
 
 
-def default_eval_frames_root(dataset_root: Path) -> Path:
-    return (dataset_root / CHOLEC80_EVAL_FRAMES_DIRNAME).resolve()
+def package_eval_frames_root() -> Path:
+    """Resolved path: surgical_vlm_test/../eval/cholec80/frames_0p1fps."""
+    return (_PKG_ROOT / CHOLEC80_EVAL_FRAMES_RELPATH).resolve()
+
+
+def default_eval_frames_root(dataset_root: Path | None = None) -> Path:
+    """
+    Default pre-extracted eval frames: ../eval/cholec80/frames_0p1fps (from package root).
+    Falls back to <dataset_root>/frames_0p1fps when eval path is absent.
+    """
+    resolved = resolve_eval_frames_root(None, dataset_root=dataset_root, required=False)
+    if resolved is not None:
+        return resolved
+    return package_eval_frames_root()
+
+
+def resolve_eval_frames_root(
+    requested: Path | None = None,
+    *,
+    dataset_root: Path | None = None,
+    required: bool = True,
+) -> Path:
+    """Resolve frames root (CHOLEC80_FRAMES_ROOT env > ../eval/cholec80/frames_0p1fps > dataset)."""
+    candidates: list[Path] = []
+    if requested is not None:
+        candidates.append(requested.resolve())
+    env = __import__("os").environ.get("CHOLEC80_FRAMES_ROOT", "").strip()
+    if env:
+        candidates.append(Path(env).resolve())
+    candidates.append(package_eval_frames_root())
+    if dataset_root is not None:
+        candidates.append((dataset_root / CHOLEC80_EVAL_FRAMES_DIRNAME).resolve())
+
+    seen: set[str] = set()
+    for root in candidates:
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        if root.is_dir():
+            return root
+
+    tried = ", ".join(str(p) for p in candidates)
+    if required:
+        raise FileNotFoundError(
+            f"Cholec80 eval frames root not found (need video41/000000.png, …). Tried: {tried}"
+        )
+    return candidates[0] if candidates else package_eval_frames_root()
 
 
 def phase_annotation_filename(vid_num: int) -> str:

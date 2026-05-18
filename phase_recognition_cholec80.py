@@ -25,7 +25,9 @@ from backends import load_backend
 from cholec80_data import (
     CHOLEC80_EVAL_FPS,
     CHOLEC80_EVAL_FRAME_STRIDE,
+    CHOLEC80_EVAL_FRAMES_RELPATH,
     CANONICAL_TO_DISPLAY,
+    package_eval_frames_root,
     PHASE_CANONICAL_IDS,
     PHASE_DISPLAY_NAMES,
     _DEFAULT_MODEL_IDS,
@@ -36,6 +38,7 @@ from cholec80_data import (
     normalize_phase_label,
     parse_video_id,
     resolve_cholec80_root,
+    resolve_eval_frames_root,
     video_in_split,
 )
 from cholect50_data import infer_pil_side
@@ -45,6 +48,7 @@ _SCRIPT_ROOT = Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_ROOT.parent
 DEFAULT_DATASET_ROOT = _REPO_ROOT / "data" / "Cholec80"
 DEFAULT_OUTPUT_ROOT = _SCRIPT_ROOT / "outputs" / "phase_recognition_cholec80"
+DEFAULT_FRAMES_ROOT = package_eval_frames_root()
 _DEFAULT_HF_TOKEN = _SCRIPT_ROOT / ".hf_token"
 
 
@@ -342,8 +346,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--frames-root",
         type=Path,
-        default=None,
-        help="Pre-extracted frames (video41/000123.png). Skips MP4 decode; PIL only.",
+        default=DEFAULT_FRAMES_ROOT,
+        help=(
+            "Pre-extracted 0.1 fps frames + videoNN-phase.txt manifests "
+            f"(default: {CHOLEC80_EVAL_FRAMES_RELPATH})."
+        ),
     )
     p.add_argument(
         "--frame-reader",
@@ -387,9 +394,11 @@ def main() -> None:
     user_prompt, prompt_meta = build_phase_recognition_prompt()
     option_map = prompt_meta.get("option_map") or {}
 
-    frames_root = args.frames_root.resolve() if args.frames_root else None
-    if frames_root is not None and not frames_root.is_dir():
-        raise FileNotFoundError(f"--frames-root not found: {frames_root}")
+    frames_root = resolve_eval_frames_root(
+        args.frames_root,
+        dataset_root=dataset_root,
+        required=True,
+    )
 
     frame_stride_arg = (
         max(1, int(args.frame_stride)) if args.frame_stride is not None else None

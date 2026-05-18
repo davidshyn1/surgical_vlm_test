@@ -14,12 +14,13 @@ if str(_SCRIPT_ROOT) not in sys.path:
 from cholec80_data import (  # noqa: E402
     CHOLEC80_EVAL_FPS,
     CHOLEC80_EVAL_FRAME_STRIDE,
+    CHOLEC80_EVAL_FRAMES_RELPATH,
     CHOLEC80_VIDEO_FPS,
     build_subsampled_phase_annotations_for_split,
-    default_eval_frames_root,
     infer_native_phase_frame_stride,
     parse_video_id,
     resolve_cholec80_root,
+    resolve_eval_frames_root,
     video_in_split,
 )
 
@@ -35,7 +36,7 @@ def parse_args() -> argparse.Namespace:
         "--frames-root",
         type=Path,
         default=None,
-        help="Output root (default: <dataset-root>/frames_0p1fps).",
+        help=f"Output root (default: {CHOLEC80_EVAL_FRAMES_RELPATH}).",
     )
     p.add_argument("--split", choices=("eval", "train", "all"), default="eval")
     p.add_argument("--video", type=str, default=None)
@@ -51,10 +52,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     dataset_root = resolve_cholec80_root(args.dataset_root)
-    frames_root = (
-        args.frames_root.resolve()
-        if args.frames_root is not None
-        else default_eval_frames_root(dataset_root)
+    frames_root = resolve_eval_frames_root(
+        args.frames_root,
+        dataset_root=dataset_root,
+        required=False,
     )
     frames_root.mkdir(parents=True, exist_ok=True)
 

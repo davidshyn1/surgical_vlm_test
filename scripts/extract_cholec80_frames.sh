@@ -13,7 +13,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CHOLEC80_ROOT="${CHOLEC80_ROOT:-$ROOT/../data/cholec80}"
-OUT_ROOT="${OUT_ROOT:-$CHOLEC80_ROOT/frames_0p1fps}"
+OUT_ROOT="${OUT_ROOT:-$ROOT/../eval/cholec80/frames_0p1fps}"
 STRIDE=250
 VID_START="${VID_START:-41}"
 VID_END="${VID_END:-80}"
