@@ -8,7 +8,8 @@ CholecT50 **triplet recognition** · Cholec80 **phase recognition** · EndoVis 2
 | 경로 | 로드 방식 | 용도 |
 |------|-----------|------|
 | **`prismatic`** | `../backend/prismatic-vlms` + Hub id 또는 로컬 `.pt` + `config.json` | TRI-ML Prismatic 전용 |
-| **`cosmos-*` / `qwen3-*` / `internvl*` / `paligemma*` / `groot`** | Hugging Face Hub → `AutoProcessor` + `AutoModel*` / `Qwen3VL*` → `model.generate()` | 사전학습 VLM **추론(eval)만** (학습 없음) |
+| **`cosmos-*` / `qwen3-*` / `internvl*` / `paligemma*` / `groot`** | Hugging Face Hub → `AutoProcessor` + `model.generate()` | 로컬 GPU **추론(eval)만** |
+| **`openai` / `gpt` / `gemini` / `claude`** | Cloud vision API (`api_backends.py`, JPEG base64) | API 키 필요, GPU 불필요 |
 
 - `cosmos-32b` → `nvidia/Cosmos-Reason2-32B` (Qwen3-VL 계열; `cosmos-reason2` repo venv **불필요**)
 - `qwen3-4b` / `qwen3-32b` → `Qwen/Qwen3-VL-*-Instruct`
@@ -33,6 +34,7 @@ CholecT50 **triplet recognition** · Cholec80 **phase recognition** · EndoVis 2
 | `backends.py` | VLM 로드·추론 (Prismatic / HF Auto) |
 | `backend_registry.py` | `--backend` 별칭·기본 `model-id` |
 | `hf_model_loader.py` | HF Hub `AutoProcessor` 로더 |
+| `api_backends.py` | OpenAI / Gemini / Anthropic vision API |
 | `grounding_task.sh` | 실행 런처 (`uv` + Python) |
 | `setup_backend.sh` | **prismatic** `.venv` 설치 (uv) |
 | `scripts/extract_cholec80_frames.sh` | Cholec80 0.1 fps 프레임 추출 → `../eval/cholec80/frames_0p1fps` |
@@ -188,11 +190,28 @@ If the Large Needle Driver is not in the image, answer exactly: not present
 - 매핑: `instrument_type_mapping.json` (class id 1–7 → instrument name)
 - val: `valN/image/seq_X_frameYYY.bmp`, `valN/label/seq_X_frameYYY.bmp` (mask, mode `L`)
 
-### 3.2 HF 토큰
+### 3.2 인증 (HF Hub · Cloud API)
+
+**Hugging Face** (로컬 HF / prismatic Hub):
 
 ```bash
 cp /path/to/.hf_token surgical_vlm_test/.hf_token
 ```
+
+**Cloud API** (`BACKEND=openai|gemini|claude` — `.hf_token` 불필요):
+
+| Provider | 키 파일 (기본) | 환경 변수 |
+|----------|----------------|-----------|
+| OpenAI / GPT | `surgical_vlm_test/.openai_api_key` | `OPENAI_API_KEY` |
+| Gemini | `.gemini_api_key` | `GEMINI_API_KEY` or `GOOGLE_API_KEY` |
+| Claude / Anthropic | `.anthropic_api_key` | `ANTHROPIC_API_KEY` |
+
+```bash
+echo "$OPENAI_API_KEY" > surgical_vlm_test/.openai_api_key
+chmod 600 surgical_vlm_test/.openai_api_key
+```
+
+또는 `--api-key-file /path/to/key` 로 지정.
 
 ### 3.3 백엔드 가상환경
 
@@ -262,6 +281,10 @@ export HF_PYTHON=/NHNHOME/WORKSPACE/26msit001_T_B/KAIST-AIPRLab/.conda/envs/appg
 | `internvl` / `internvl3.5` | `OpenGVLab/InternVL3_5-38B-HF` | `internvl3.5-38b` |
 | `paligemma` / `paligemma2` | `google/paligemma2-28b-pt-224` | `paligemma2-28b` |
 | `groot` | `nvidia/GR00T-H` | `groot-h` |
+| `gpt` / `openai` | `gpt-4o` | `gpt-4o` |
+| `chatgpt` | `gpt-4o-mini` | `gpt-4o-mini` |
+| `gemini` | `gemini-2.0-flash` | `gemini-2.0-flash` |
+| `claude` / `anthropic` | `claude-sonnet-4-20250514` | `claude-sonnet-4` |
 
 별칭: `BACKEND=cosmos2b` → `cosmos-2b`, `BACKEND=qwen3_32b` → `qwen3-32b`.
 
@@ -395,9 +418,20 @@ BACKEND=paligemma2 DEVICE_VISIBLE=0 \
 # PaliGemma instruct/mix (품질 권장)
 BACKEND=paligemma2 MODEL_ID=google/paligemma2-10b-mix-448 DEVICE_VISIBLE=0 \
   bash grounding_task.sh triplet_recognition_cholect50 --eval-protocol joint --max-samples 10
+
+# GPT-4o (OpenAI vision API)
+BACKEND=gpt MODEL_ID=gpt-4o bash grounding_task.sh triplet_recognition_cholect50 \
+  --eval-protocol sequential_gt --prompt-mode mcq --video VID68
+
+# Gemini
+BACKEND=gemini MODEL_ID=gemini-2.0-flash bash grounding_task.sh phase_recognition_cholec80 --video 41
+
+# Claude
+BACKEND=claude MODEL_ID=claude-3-5-sonnet-20241022 bash grounding_task.sh \
+  instrument_localization_endovis17 --max-samples 5
 ```
 
-> **주의:** `DEVICE_VISIBLE`(GPU index) 철자를 맞출 것 (`DEVISE_VISIBLE` 아님).
+> **주의:** `DEVICE_VISIBLE`(GPU index) 철자를 맞출 것 (`DEVISE_VISIBLE` 아님). API 백엔드는 GPU를 쓰지 않지만 `DEVICE_VISIBLE`은 무해합니다.
 
 #### Cholec80 phase
 
@@ -565,6 +599,8 @@ uv run --python ../backend/prismatic-vlms/.venv/bin/python \
 | `--device` | `0`, `cuda:0`, `cpu` → 내부 `torch.device` |
 | `--hf-token` | 기본 `surgical_vlm_test/.hf_token` |
 | `--max-new-tokens` | 생성 최대 토큰 수 |
+| `--api-key-file` | Cloud API 키 파일 (openai/gemini/claude) |
+| `--api-timeout-sec` | Cloud API HTTP timeout (기본 120) |
 
 ### 4.4 결과 저장 위치 (eval JSON)
 
@@ -615,7 +651,8 @@ JSON 필드 요약:
 
 | 변수 | 설명 |
 |------|------|
-| `BACKEND` | `prismatic` \| `qwen3-4b` \| `qwen3-32b` \| `cosmos-2b` \| `cosmos-32b` \| `internvl3.5` \| … |
+| `BACKEND` | `prismatic` \| `qwen3-32b` \| `cosmos-32b` \| `gpt` \| `gemini` \| `claude` \| … |
+| `API_PYTHON` | Cloud API용 Python (기본: `surgical` / `appgen` / `python3`) |
 | `HF_PYTHON` | non-prismatic 백엔드용 Python (`torch`, `transformers` 필요) |
 | `DEVICE_VISIBLE` | → `CUDA_VISIBLE_DEVICES` (기본 `0`). **철자 주의** (`DEVISE_VISIBLE` 아님) |
 | `MODEL_ID` | `--model-id` 자동 주입 (Hub repo id) |
@@ -664,6 +701,8 @@ JSON 필드 요약:
 6. **HF 401** — `.hf_token` 경로 및 권한  
 6b. **32B / 38B OOM** — `cosmos-32b`, `qwen3-32b`, `internvl3.5`는 VRAM 큼; `--video`, `--max-samples`, `--max-frames-per-video`로 축소  
 6c. **캐시를 못 찾고 재다운로드** — 가중치가 `.../huggingface/models--*`(상위)에만 있으면 `hub/`로 symlink 또는 `HF_HUB_CACHE` 조정 (§3.5)  
+6d. **API HTTP 401/403** — `.openai_api_key` / `GEMINI_API_KEY` / `ANTHROPIC_API_KEY` 확인; `--model-id`가 vision 지원 모델인지 확인  
+6e. **API 비용·속도** — `sequential_gt` + `--eval-all`은 호출 수 많음; 스모크는 `--video` / `--max-samples` 권장  
 7. **resume** — 동일 `--output` JSON에 이어서 실행; 전체 재실행은 `--force`  
 8. **triplet sequential이 느림** — annotation당 VLM 3회; 빠른 테스트는 `--eval-protocol joint` 또는 `--samples-only`  
 9. **phase eval이 너무 느림** — 기본 `../eval/cholec80/frames_0p1fps`(0.1 fps, ~9.8k calls); 25 fps는 `--frame-stride 1`  

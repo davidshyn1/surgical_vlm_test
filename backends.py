@@ -19,7 +19,9 @@ from typing import Any
 import torch
 from PIL import Image
 
+from api_backends import load_api_backend
 from backend_registry import (
+    is_api_backend,
     is_hf_backend,
     is_prismatic_backend,
     normalize_backend_key,
@@ -349,24 +351,37 @@ def load_backend(
     *,
     model_id: str | None = None,
     hf_token: str | None = None,
+    api_key: str | None = None,
+    api_key_file: Path | None = None,
     vlm_checkpoint: Path | None = None,
     vlm_config: Path | None = None,
     device: str | torch.device = "cuda",
+    api_timeout_sec: int = 120,
 ) -> tuple[VLMBackend, dict[str, Any]]:
     """
     Load a VLM backend.
 
     - backend="prismatic": TRI-ML prismatic-vlms only (optional local .pt + config.json)
-    - backend in {hf, qwen3, internvl3.5, paligemma2, cosmos, groot, …}: transformers AutoProcessor
+    - backend in {hf, qwen3, internvl3.5, …}: transformers AutoProcessor
+    - backend in {openai, gpt, gemini, claude, …}: cloud vision API (OpenAI / Gemini / Anthropic)
     """
     name = normalize_backend_key(backend)
     mid = resolve_model_id(name, model_id)
 
     if is_prismatic_backend(name):
         return _load_prismatic(mid, hf_token, vlm_checkpoint, vlm_config, device)
+    if is_api_backend(name):
+        api_backend, meta = load_api_backend(
+            name,
+            mid,
+            api_key=api_key,
+            api_key_file=api_key_file,
+            timeout_sec=api_timeout_sec,
+        )
+        return api_backend, meta  # type: ignore[return-value]
     if is_hf_backend(name):
         return _load_hf(mid, hf_token, device)
     raise ValueError(
         f"Unknown backend {backend!r}. Use one of: prismatic, hf, qwen3, internvl3.5, "
-        "paligemma2, cosmos, groot, …"
+        "paligemma2, cosmos, openai, gemini, claude, …"
     )

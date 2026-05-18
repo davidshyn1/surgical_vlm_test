@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 # CLI --backend choices (prismatic = TRI-ML loader; others = HF AutoProcessor)
 BACKEND_CHOICES: tuple[str, ...] = (
@@ -24,6 +25,13 @@ BACKEND_CHOICES: tuple[str, ...] = (
     "internvl3.5",
     "paligemma",
     "paligemma2",
+    # Cloud APIs (vision)
+    "openai",
+    "gpt",
+    "chatgpt",
+    "gemini",
+    "claude",
+    "anthropic",
 )
 
 # Hub model_id per --backend (override with --model-id)
@@ -46,6 +54,13 @@ DEFAULT_MODEL_IDS: dict[str, str] = {
     "paligemma": "google/paligemma2-28b-pt-224",
     "paligemma2": "google/paligemma2-28b-pt-224",
     "groot": "nvidia/GR00T-H",
+    # Cloud APIs (--model-id = API model name)
+    "openai": "gpt-4o",
+    "gpt": "gpt-4o",
+    "chatgpt": "gpt-4o-mini",
+    "gemini": "gemini-2.0-flash",
+    "claude": "claude-sonnet-4-20250514",
+    "anthropic": "claude-sonnet-4-20250514",
 }
 
 # Default output folder slug when --model-name is omitted (or "original")
@@ -65,6 +80,12 @@ BACKEND_OUTPUT_SLUGS: dict[str, str] = {
     "paligemma": "paligemma2-28b",
     "paligemma2": "paligemma2-28b",
     "groot": "groot-h",
+    "openai": "gpt-4o",
+    "gpt": "gpt-4o",
+    "chatgpt": "gpt-4o-mini",
+    "gemini": "gemini-2.0-flash",
+    "claude": "claude-sonnet-4",
+    "anthropic": "claude-sonnet-4",
 }
 
 # Accept cosmos2b, qwen3_32b, etc. on CLI / BACKEND= env
@@ -80,6 +101,18 @@ _BACKEND_KEY_ALIASES: dict[str, str] = {
     "qwen3vl32b": "qwen3-32b",
     "qwen3-vl-32b": "qwen3-32b",
 }
+
+_API_ALIASES = frozenset(
+    {
+        "openai",
+        "gpt",
+        "chatgpt",
+        "gemini",
+        "google",
+        "claude",
+        "anthropic",
+    }
+)
 
 _HF_ALIASES = frozenset(
     {
@@ -117,6 +150,17 @@ def is_prismatic_backend(backend: str) -> bool:
 
 def is_hf_backend(backend: str) -> bool:
     return normalize_backend_key(backend) in _HF_ALIASES
+
+
+def is_api_backend(backend: str) -> bool:
+    return normalize_backend_key(backend) in _API_ALIASES
+
+
+def resolve_hf_token(backend: str, token_path: Path) -> str | None:
+    """Return HF hub token text, or None for cloud API backends (no Hub download)."""
+    if is_api_backend(backend):
+        return None
+    return token_path.resolve().read_text(encoding="utf-8").strip()
 
 
 def resolve_model_id(backend: str, model_id: str | None) -> str:

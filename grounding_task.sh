@@ -44,6 +44,13 @@ is_prismatic_backend() {
   [[ "${1,,}" == "prismatic" ]]
 }
 
+is_api_backend() {
+  case "${1,,}" in
+    openai|gpt|chatgpt|gemini|google|claude|anthropic) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 backend_repo_dir() {
   case "$1" in
     prismatic) echo "$VLA_ROOT/prismatic-vlms" ;;
@@ -93,6 +100,11 @@ resolve_backend_python() {
     [[ -z "$py" && -x "$ROOT/.venv-prismatic/bin/python" ]] && py="$ROOT/.venv-prismatic/bin/python"
     [[ -z "$py" ]] && py="$(guess_conda_python prismatic || true)"
     [[ -z "$py" && -x "$GVL_PRISMATIC_DEFAULT" ]] && py="$GVL_PRISMATIC_DEFAULT"
+  elif is_api_backend "$backend"; then
+    py="${API_PYTHON:-${HF_PYTHON:-}}"
+    [[ -z "$py" ]] && py="$(guess_conda_python surgical || true)"
+    [[ -z "$py" ]] && py="$(guess_conda_python appgen || true)"
+    [[ -z "$py" && -x "$(command -v python3)" ]] && py="$(command -v python3)"
   else
     py="${HF_PYTHON:-}"
     [[ -z "$py" && -x "$ROOT/.venv-hf/bin/python" ]] && py="$ROOT/.venv-hf/bin/python"
@@ -104,6 +116,7 @@ resolve_backend_python() {
     echo "ERROR: Python not found for backend '$backend'" >&2
     echo "  prismatic: set PRISMATIC_PYTHON or run setup_backend.sh prismatic" >&2
     echo "  hf/qwen3/internvl/…: set HF_PYTHON to a transformers-capable interpreter" >&2
+    echo "  openai/gemini/claude: set API_PYTHON (lightweight env; needs requests via stdlib only)" >&2
     exit 2
   fi
   echo "$py"
@@ -129,7 +142,8 @@ Backends:
   prismatic     TRI-ML prismatic-vlms (local backend package / checkpoint)
   hf            transformers AutoProcessor (set MODEL_ID or --model-id)
   qwen3-4b, qwen3-32b, cosmos-2b, cosmos-32b  size-specific (see backend_registry.py)
-  internvl3.5, paligemma2, groot              other families
+  internvl3.5, paligemma2, groot              other HF families
+  openai, gpt, chatgpt, gemini, claude        cloud vision APIs (API keys in .openai_api_key etc.)
 
 Examples:
   BACKEND=prismatic DEVICE_VISIBLE=0 \\
@@ -145,7 +159,8 @@ Examples:
     bash grounding_task.sh phase_recognition_cholec80 --video 41
 
 Env:
-  HF_PYTHON                     Python for non-prismatic backends (transformers)
+  HF_PYTHON                     Python for local HF backends (transformers)
+  API_PYTHON                    Python for openai/gemini/claude (default: same as HF_PYTHON)
   PRISMATIC_PYTHON              Python for prismatic backend
   MODEL_ID                      default --model-id when omitted
   MODEL_NAME                    default --model-name (output folder slug) when omitted

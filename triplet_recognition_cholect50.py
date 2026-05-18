@@ -24,7 +24,12 @@ from typing import Any
 import torch
 from PIL import Image
 
-from backend_registry import BACKEND_CHOICES, resolve_model_id, resolve_output_model_name
+from backend_registry import (
+    BACKEND_CHOICES,
+    resolve_hf_token,
+    resolve_model_id,
+    resolve_output_model_name,
+)
 from backends import build_vlm_user_prompt, load_backend
 from cholect50_data import (
     CHALLENGE_VAL_ROOT,
@@ -1036,6 +1041,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vlm-checkpoint", type=Path, default=None)
     p.add_argument("--vlm-config", type=Path, default=None)
     p.add_argument("--hf-token", type=Path, default=_DEFAULT_HF_TOKEN)
+    p.add_argument(
+        "--api-key-file",
+        type=Path,
+        default=None,
+        help="API key file for openai/gemini/claude backends (default: .openai_api_key, etc.).",
+    )
+    p.add_argument("--api-timeout-sec", type=int, default=120)
     p.add_argument("--device", type=str, default="0")
     p.add_argument("--do-sample", action="store_true")
     p.add_argument("--temperature", type=float, default=0.4)
@@ -1119,16 +1131,18 @@ def main() -> None:
         file=sys.stderr,
     )
 
-    hf_token = args.hf_token.resolve().read_text(encoding="utf-8").strip()
+    hf_token = resolve_hf_token(args.backend, args.hf_token)
     device = resolve_device(args.device)
 
     backend, meta = load_backend(
         args.backend,
         model_id=model_id,
         hf_token=hf_token,
+        api_key_file=args.api_key_file,
         vlm_checkpoint=args.vlm_checkpoint,
         vlm_config=args.vlm_config,
         device=device,
+        api_timeout_sec=args.api_timeout_sec,
     )
     backend.to(device, dtype=torch.bfloat16)
     pil_side = getattr(backend, "image_size", None) or infer_pil_side(args)
