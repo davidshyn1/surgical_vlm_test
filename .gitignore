@@ -1,0 +1,7 @@
+.venv-*
+outputs/
+__pycache__/
+*.py[cod]
+.hf_token
+.gemini_api_key
+.openai_api_key
