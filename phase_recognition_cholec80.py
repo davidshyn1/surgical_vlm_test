@@ -21,8 +21,10 @@ from typing import Any
 import torch
 from PIL import Image
 
+from api_backends import ApiVisionJob, api_parallel_enabled, clear_image_encode_cache
 from backend_registry import (
     BACKEND_CHOICES,
+    is_api_backend,
     resolve_hf_token,
     resolve_model_id,
     resolve_output_model_name,
@@ -266,18 +268,19 @@ def _run_vlm_on_frame(
             (pil_side, pil_side),
             resample=Image.Resampling.BICUBIC,
         )
-        gen_kw: dict[str, Any] = {"do_sample": args.do_sample, "min_length": 1}
+        gen_kw: dict[str, Any] = {
+            "do_sample": args.do_sample,
+            "min_length": 1,
+            "max_new_tokens": args.max_new_tokens,
+            "request_timeout_sec": args.api_timeout_sec,
+        }
         if args.do_sample:
             gen_kw["temperature"] = args.temperature
 
         prompt_text = build_vlm_user_prompt(
             backend, user_prompt, wrap=wrap_vlm_prompt,
         )
-        text = backend.generate(
-            image,
-            prompt_text,
-            **{**gen_kw, "max_new_tokens": args.max_new_tokens},
-        )
+        text = backend.generate(image, prompt_text, **gen_kw)
         parsed = parse_phase_response(text, option_map=option_map)
         return {"text": text, "parsed": parsed}
     except Exception as e:
@@ -380,6 +383,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hf-token", type=Path, default=_DEFAULT_HF_TOKEN)
     p.add_argument("--api-key-file", type=Path, default=None)
     p.add_argument("--api-timeout-sec", type=int, default=120)
+    p.add_argument(
+        "--api-workers",
+        type=int,
+        default=1,
+        help="Parallel cloud API requests (openai/gemini/claude only; default 1 = serial).",
+    )
     p.add_argument("--device", type=str, default="0")
     p.add_argument("--do-sample", action="store_true")
     p.add_argument("--temperature", type=float, default=0.4)
@@ -477,6 +486,9 @@ def main() -> None:
 
     hf_token = resolve_hf_token(args.backend, args.hf_token)
     device = resolve_device(args.device)
+    api_workers = max(1, int(args.api_workers)) if is_api_backend(args.backend) else 1
+    if is_api_backend(args.backend):
+        clear_image_encode_cache()
 
     backend, meta = load_backend(
         args.backend,
@@ -487,9 +499,14 @@ def main() -> None:
         vlm_config=args.vlm_config,
         device=device,
         api_timeout_sec=args.api_timeout_sec,
+        api_workers=api_workers,
     )
     backend.to(device, dtype=torch.bfloat16)
     pil_side = getattr(backend, "image_size", None) or infer_pil_side(args)
+    use_api_parallel = api_parallel_enabled(backend, api_workers)
+    phase_prompt_text = build_vlm_user_prompt(
+        backend, user_prompt, wrap=wrap_vlm_prompt,
+    )
 
     results, key_to_idx = load_results_for_resume(out_path)
     vlm_calls = 0
@@ -507,6 +524,18 @@ def main() -> None:
             entry["evaluation"] = ev
         upsert_result(results, key_to_idx, row_key, entry)
 
+    def _api_gen_kw() -> dict[str, Any]:
+        gen_kw: dict[str, Any] = {
+            "do_sample": args.do_sample,
+            "min_length": 1,
+            "max_new_tokens": args.max_new_tokens,
+            "request_timeout_sec": args.api_timeout_sec,
+        }
+        if args.do_sample:
+            gen_kw["temperature"] = args.temperature
+        return gen_kw
+
+    pending_phase: list[dict[str, Any]] = []
     for video_path, video_samples in iter_samples_by_video(samples):
         for sample in video_samples:
             row_key = _row_key(sample)
@@ -529,7 +558,59 @@ def main() -> None:
                 if ev:
                     rec["evaluation"] = ev
                 continue
+            pending_phase.append(sample)
 
+    if use_api_parallel and pending_phase:
+        parallel_note = f", api_workers={api_workers}"
+        print(
+            f"Parallel API phase inference: {len(pending_phase)} frame(s){parallel_note}.",
+            file=sys.stderr,
+        )
+        api_jobs: list[ApiVisionJob] = []
+        job_sample: dict[str, dict[str, Any]] = {}
+        for sample in pending_phase:
+            img_path = sample.get("img_path")
+            if not img_path:
+                _upsert_scored(sample, {"error": "missing img_path"})
+                continue
+            job_id = str(Path(img_path).resolve())
+            gkw = _api_gen_kw()
+            gkw["image_cache_key"] = job_id
+            api_jobs.append(
+                ApiVisionJob(
+                    job_id=job_id,
+                    prompt=phase_prompt_text,
+                    image_path=img_path,
+                    pil_side=pil_side,
+                    gen_kw=gkw,
+                )
+            )
+            job_sample[job_id] = sample
+
+        def _on_phase_api_done(res: Any) -> None:
+            if res.error:
+                print(f"SKIP {res.job_id}: {res.error}", file=sys.stderr)
+
+        api_results = backend.generate_parallel(
+            api_jobs,
+            workers=api_workers,
+            on_result=_on_phase_api_done,
+        )
+        vlm_calls += len(api_results)
+        for res in api_results:
+            sample = job_sample.get(str(res.job_id))
+            if sample is None:
+                continue
+            if res.error:
+                frame_output: dict[str, Any] = {"error": res.error}
+            else:
+                parsed = parse_phase_response(res.text or "", option_map=option_map)
+                frame_output = {"text": res.text, "parsed": parsed}
+            _upsert_scored(sample, frame_output)
+            if vlm_calls % 50 == 0:
+                print(f"  ... {vlm_calls} VLM calls", file=sys.stderr)
+    else:
+        for sample in pending_phase:
             try:
                 pil_image = load_frame_rgb(
                     sample,
@@ -537,7 +618,9 @@ def main() -> None:
                 )
             except Exception as e:
                 print(
-                    f"SKIP {sample['vid']} f{sample['frame_index']}: {e}", file=sys.stderr)
+                    f"SKIP {sample['vid']} f{sample['frame_index']}: {e}",
+                    file=sys.stderr,
+                )
                 _upsert_scored(sample, {"error": str(e)})
                 continue
 

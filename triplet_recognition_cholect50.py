@@ -18,14 +18,17 @@ import json
 import re
 import sys
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
 import torch
 from PIL import Image
 
+from api_backends import ApiVisionJob, api_parallel_enabled, clear_image_encode_cache
 from backend_registry import (
     BACKEND_CHOICES,
+    is_api_backend,
     resolve_hf_token,
     resolve_model_id,
     resolve_output_model_name,
@@ -825,7 +828,13 @@ def _generate_vlm_text(
 ) -> str:
     image = Image.open(image_path).convert("RGB")
     image = image.resize((pil_side, pil_side), resample=Image.Resampling.BICUBIC)
-    gen_kw: dict[str, Any] = {"do_sample": args.do_sample, "min_length": 1}
+    gen_kw: dict[str, Any] = {
+        "do_sample": args.do_sample,
+        "min_length": 1,
+        "max_new_tokens": args.max_new_tokens,
+        "request_timeout_sec": args.api_timeout_sec,
+        "image_cache_key": str(image_path.resolve()),
+    }
     if args.do_sample:
         gen_kw["temperature"] = args.temperature
     prompt_text = build_vlm_user_prompt(
@@ -834,8 +843,20 @@ def _generate_vlm_text(
     return backend.generate(
         image,
         prompt_text,
-        **{**gen_kw, "max_new_tokens": args.max_new_tokens},
+        **gen_kw,
     )
+
+
+def _api_gen_kw_base(args: argparse.Namespace) -> dict[str, Any]:
+    gen_kw: dict[str, Any] = {
+        "do_sample": args.do_sample,
+        "min_length": 1,
+        "max_new_tokens": args.max_new_tokens,
+        "request_timeout_sec": args.api_timeout_sec,
+    }
+    if args.do_sample:
+        gen_kw["temperature"] = args.temperature
+    return gen_kw
 
 
 def _run_vlm_on_frame(
@@ -1048,6 +1069,12 @@ def parse_args() -> argparse.Namespace:
         help="API key file for openai/gemini/claude backends (default: .openai_api_key, etc.).",
     )
     p.add_argument("--api-timeout-sec", type=int, default=120)
+    p.add_argument(
+        "--api-workers",
+        type=int,
+        default=1,
+        help="Parallel cloud API requests (openai/gemini/claude only; default 1 = serial).",
+    )
     p.add_argument("--device", type=str, default="0")
     p.add_argument("--do-sample", action="store_true")
     p.add_argument("--temperature", type=float, default=0.4)
@@ -1134,6 +1161,10 @@ def main() -> None:
     hf_token = resolve_hf_token(args.backend, args.hf_token)
     device = resolve_device(args.device)
 
+    api_workers = max(1, int(args.api_workers)) if is_api_backend(args.backend) else 1
+    if is_api_backend(args.backend):
+        clear_image_encode_cache()
+
     backend, meta = load_backend(
         args.backend,
         model_id=model_id,
@@ -1143,9 +1174,18 @@ def main() -> None:
         vlm_config=args.vlm_config,
         device=device,
         api_timeout_sec=args.api_timeout_sec,
+        api_workers=api_workers,
     )
     backend.to(device, dtype=torch.bfloat16)
     pil_side = getattr(backend, "image_size", None) or infer_pil_side(args)
+    use_api_parallel = api_parallel_enabled(backend, api_workers)
+    joint_prompt_text = ""
+    if args.eval_protocol == EVAL_PROTOCOL_JOINT:
+        if not isinstance(user_prompt, str):
+            raise TypeError("joint eval expects user_prompt to be a string")
+        joint_prompt_text = build_vlm_user_prompt(
+            backend, user_prompt, wrap=wrap_vlm_prompt,
+        )
 
     results, key_to_idx = load_results_for_resume(out_path)
     vlm_calls = 0
@@ -1173,11 +1213,14 @@ def main() -> None:
     if args.eval_protocol == EVAL_PROTOCOL_JOINT:
         by_frame = _group_samples_by_frame(sampled)
         n_frames = len(by_frame)
+        parallel_note = f", api_workers={api_workers}" if use_api_parallel else ""
         print(
             f"Frame-level inference: {n_frames} unique frame(s), "
-            f"{len(sampled)} annotation(s), one model load.",
+            f"{len(sampled)} annotation(s), one model load{parallel_note}.",
             file=sys.stderr,
         )
+
+        pending_joint: list[tuple[str, list[dict[str, Any]]]] = []
         for path_str in sorted(by_frame.keys()):
             frame_items = by_frame[path_str]
             all_done = True
@@ -1201,42 +1244,73 @@ def main() -> None:
 
             frame_output = None if args.force else _find_cached_frame_output(results, path_str)
             if frame_output is None:
-                frame_output = _run_vlm_on_frame(
-                    backend=backend,
-                    pil_side=pil_side,
-                    image_path=Path(path_str),
-                    user_prompt=str(user_prompt),
-                    prompt_meta=prompt_meta,
-                    args=args,
-                )
-                vlm_calls += 1
+                pending_joint.append((path_str, frame_items))
+            else:
+                for s in frame_items:
+                    _upsert_scored_entry(s, frame_output, prompt_field=str(user_prompt))
 
-            for s in frame_items:
-                _, tool = _row_key(s)
-                if (
-                    not args.force
-                    and (path_str, tool) in key_to_idx
-                    and _should_skip_resume(results[key_to_idx[(path_str, tool)]], tool)
-                ):
-                    rec = results[key_to_idx[(path_str, tool)]]
-                    inp = rec.setdefault("input", {})
-                    inp["label_context"] = _label_context_from_parsed(s["parsed"])
-                    if frame_output and not frame_output.get("error"):
-                        rec["output"] = {
-                            "text": frame_output.get("text"),
-                            "parsed": frame_output.get("parsed"),
-                        }
-                    ev = _score_record(rec)
-                    if ev:
-                        rec["evaluation"] = ev
-                    continue
-                _upsert_scored_entry(s, frame_output, prompt_field=str(user_prompt))
+        if pending_joint:
+            if use_api_parallel:
+                api_jobs: list[ApiVisionJob] = []
+                for path_str, _frame_items in pending_joint:
+                    gkw = _api_gen_kw_base(args)
+                    gkw["image_cache_key"] = str(Path(path_str).resolve())
+                    api_jobs.append(
+                        ApiVisionJob(
+                            job_id=path_str,
+                            prompt=joint_prompt_text,
+                            image_path=path_str,
+                            pil_side=pil_side,
+                            gen_kw=gkw,
+                        )
+                    )
+
+                def _on_joint_api_done(res: Any) -> None:
+                    if res.error:
+                        print(f"SKIP {res.job_id}: {res.error}", file=sys.stderr)
+
+                api_results = backend.generate_parallel(
+                    api_jobs,
+                    workers=api_workers,
+                    on_result=_on_joint_api_done,
+                )
+                vlm_calls += len(api_results)
+                out_by_path = {r.job_id: r for r in api_results}
+                for path_str, frame_items in pending_joint:
+                    res = out_by_path.get(path_str)
+                    if res is None or res.error:
+                        frame_output = {"error": res.error if res else "missing result"}
+                    else:
+                        triplet = parse_triplet_response(
+                            res.text or "",
+                            prompt_mode=args.prompt_mode,
+                            prompt_meta=prompt_meta,
+                        )
+                        frame_output = {"text": res.text, "parsed": triplet}
+                    for s in frame_items:
+                        _upsert_scored_entry(s, frame_output, prompt_field=str(user_prompt))
+            else:
+                for path_str, frame_items in pending_joint:
+                    frame_output = _run_vlm_on_frame(
+                        backend=backend,
+                        pil_side=pil_side,
+                        image_path=Path(path_str),
+                        user_prompt=str(user_prompt),
+                        prompt_meta=prompt_meta,
+                        args=args,
+                    )
+                    vlm_calls += 1
+                    for s in frame_items:
+                        _upsert_scored_entry(s, frame_output, prompt_field=str(user_prompt))
     else:
+        parallel_note = f", api_workers={api_workers} (per-annotation)" if use_api_parallel else ""
         print(
             f"Sequential inference: {len(sampled)} annotation(s), "
-            f"3 VLM calls each, context={'GT' if use_gt_context else 'predicted'}.",
+            f"3 VLM calls each, context={'GT' if use_gt_context else 'predicted'}"
+            f"{parallel_note}.",
             file=sys.stderr,
         )
+        pending_seq: list[dict[str, Any]] = []
         for sample in sampled:
             path_str, tool = _row_key(sample)
             if (
@@ -1251,24 +1325,45 @@ def main() -> None:
                 if ev:
                     rec["evaluation"] = ev
                 continue
+            pending_seq.append(sample)
 
-            frame_output = _run_sequential_triplet(
+        def _run_one_sequential(sample_row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+            path_str, _tool = _row_key(sample_row)
+            out = _run_sequential_triplet(
                 backend=backend,
                 pil_side=pil_side,
                 image_path=Path(path_str),
-                sample=sample,
+                sample=sample_row,
                 prompt_meta=prompt_meta,
                 args=args,
                 use_gt_context=use_gt_context,
             )
-            if not frame_output.get("error"):
-                vlm_calls += len(frame_output.get("sequential_steps") or [])
-            step_prompts = {
-                s["step"]: s["prompt"]
-                for s in (frame_output.get("sequential_steps") or [])
-                if isinstance(s, dict) and s.get("step")
-            }
-            _upsert_scored_entry(sample, frame_output, prompt_field=step_prompts)
+            return sample_row, out
+
+        if use_api_parallel and pending_seq:
+            with ThreadPoolExecutor(max_workers=api_workers) as pool:
+                futures = [pool.submit(_run_one_sequential, s) for s in pending_seq]
+                for fut in as_completed(futures):
+                    sample_row, frame_output = fut.result()
+                    if not frame_output.get("error"):
+                        vlm_calls += len(frame_output.get("sequential_steps") or [])
+                    step_prompts = {
+                        st["step"]: st["prompt"]
+                        for st in (frame_output.get("sequential_steps") or [])
+                        if isinstance(st, dict) and st.get("step")
+                    }
+                    _upsert_scored_entry(sample_row, frame_output, prompt_field=step_prompts)
+        else:
+            for sample in pending_seq:
+                sample_row, frame_output = _run_one_sequential(sample)
+                if not frame_output.get("error"):
+                    vlm_calls += len(frame_output.get("sequential_steps") or [])
+                step_prompts = {
+                    st["step"]: st["prompt"]
+                    for st in (frame_output.get("sequential_steps") or [])
+                    if isinstance(st, dict) and st.get("step")
+                }
+                _upsert_scored_entry(sample_row, frame_output, prompt_field=step_prompts)
 
     print(f"VLM forward passes this run: {vlm_calls}", file=sys.stderr)
 

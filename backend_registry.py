@@ -74,7 +74,7 @@ BACKEND_OUTPUT_SLUGS: dict[str, str] = {
     "qwen3": "qwen3-vl-4b",
     "qwen3-4b": "qwen3-vl-4b",
     "qwen3-32b": "qwen3-vl-32b",
-    "qwen2.5": "qwen2.5-vl-7b",
+    "qwen2.5": "qwen2.5-vl-32b",
     "internvl": "internvl3.5-38b",
     "internvl3.5": "internvl3.5-38b",
     "paligemma": "paligemma2-28b",
@@ -190,12 +190,19 @@ def resolve_output_model_name(
     Folder slug for outputs/.../{backend}_{model_name}/.
 
     Uses --model-name when set (and not the legacy placeholder 'original').
-    Otherwise uses BACKEND_OUTPUT_SLUGS or the Hub repo tail.
+    When ``model_id`` differs from the backend default (e.g. PEFT LoRA adapter
+    ``khtks/Qwen3-VL/surgsigma_qwen3vl_full`` on ``qwen3-4b``), uses the Hub
+    path tail so finetuned checkpoints do not overwrite base-model results.
+    Otherwise uses BACKEND_OUTPUT_SLUGS.
     """
     name = (user_name or "").strip()
     if name and name.lower() != "original":
         return re.sub(r"[^a-zA-Z0-9._-]+", "_", name).strip("_") or "model"
     key = normalize_backend_key(backend)
+    default_id = DEFAULT_MODEL_IDS.get(key)
+    mid = model_id.strip().rstrip("/")
+    if default_id and mid != default_id.strip().rstrip("/"):
+        return hub_id_to_output_slug(model_id)
     if key in BACKEND_OUTPUT_SLUGS:
         return BACKEND_OUTPUT_SLUGS[key]
     return hub_id_to_output_slug(model_id)

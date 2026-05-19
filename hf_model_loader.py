@@ -9,6 +9,7 @@ Prismatic checkpoints use backends.load_backend(..., backend="prismatic") only.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -109,6 +110,13 @@ def _dtype_for_device(device: str | torch.device) -> torch.dtype:
     return torch.bfloat16 if dev.type == "cuda" and torch.cuda.is_available() else torch.float32
 
 
+def _set_eval_mode(model: Any) -> Any:
+    """Inference: disable dropout / batchnorm train behavior after load."""
+    if hasattr(model, "eval"):
+        model.eval()
+    return model
+
+
 def ensure_eagle_block2a_bundle() -> None:
     import urllib.error
     import urllib.request
@@ -153,6 +161,409 @@ def _ensure_internvl_deps(model_id: str) -> None:
         ) from None
 
 
+def _split_hub_model_id(model_id: str) -> tuple[str, str | None]:
+    """
+    ``org/repo/subfolder`` → (``org/repo``, ``subfolder``).
+    ``org/repo`` → (``org/repo``, None).
+    """
+    parts = model_id.strip().strip("/").split("/")
+    if len(parts) <= 2:
+        return model_id.strip(), None
+    return "/".join(parts[:2]), "/".join(parts[2:])
+
+
+def _hf_download_file(
+    repo_id: str,
+    filename: str,
+    *,
+    cache_dir: str,
+    token: str | None,
+) -> Path | None:
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        return None
+    try:
+        path = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            cache_dir=cache_dir,
+            token=token,
+        )
+        return Path(path)
+    except Exception:
+        return None
+
+
+def resolve_peft_adapter_dir(
+    model_id: str,
+    *,
+    cache_dir: str,
+    token: str | None = None,
+) -> Path | None:
+    """
+    Return a local directory containing ``adapter_config.json``, or None.
+    Supports a local path or Hub ids like ``khtks/Qwen3-VL/surgsigma_qwen3vl_full``.
+    """
+    local = Path(model_id).expanduser()
+    if local.is_dir() and (local / "adapter_config.json").is_file():
+        return local.resolve()
+
+    repo_id, subfolder = _split_hub_model_id(model_id)
+
+    if subfolder is not None:
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError:
+            pass
+        else:
+            try:
+                root = snapshot_download(
+                    repo_id=repo_id,
+                    allow_patterns=[f"{subfolder}/*"],
+                    cache_dir=cache_dir,
+                    token=token,
+                )
+                adapter_dir = Path(root) / subfolder
+                if (adapter_dir / "adapter_config.json").is_file():
+                    return adapter_dir.resolve()
+            except Exception:
+                pass
+
+    rel_cfg = (
+        f"{subfolder}/adapter_config.json" if subfolder else "adapter_config.json"
+    )
+    cfg_path = _hf_download_file(
+        repo_id,
+        rel_cfg,
+        cache_dir=cache_dir,
+        token=token,
+    )
+    if cfg_path is not None and cfg_path.is_file():
+        return cfg_path.parent.resolve()
+    return None
+
+
+def read_peft_adapter_config(adapter_dir: Path) -> dict[str, Any]:
+    path = adapter_dir / "adapter_config.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _peft_adapter_has_weights(adapter_dir: Path) -> bool:
+    return (adapter_dir / "adapter_model.safetensors").is_file() or (
+        adapter_dir / "adapter_model.bin"
+    ).is_file()
+
+
+def _ensure_peft_adapter_weights(
+    adapter_dir: Path,
+    adapter_model_id: str,
+    *,
+    cache_dir: str,
+    token: str | None,
+) -> Path:
+    """Download ``adapter_model.*`` when only ``adapter_config.json`` is cached."""
+    if _peft_adapter_has_weights(adapter_dir):
+        return adapter_dir
+
+    repo_id, subfolder = _split_hub_model_id(adapter_model_id)
+    if subfolder is None:
+        raise FileNotFoundError(
+            f"PEFT adapter weights missing under {adapter_dir}; "
+            "expected adapter_model.safetensors or adapter_model.bin."
+        )
+
+    try:
+        from huggingface_hub import hf_hub_download, snapshot_download
+    except ImportError as e:
+        raise ImportError(
+            "huggingface_hub is required to download PEFT adapter weights."
+        ) from e
+
+    last_err: Exception | None = None
+    for fname in ("adapter_model.safetensors", "adapter_model.bin"):
+        try:
+            hf_hub_download(
+                repo_id=repo_id,
+                filename=f"{subfolder}/{fname}",
+                cache_dir=cache_dir,
+                token=token,
+            )
+            break
+        except Exception as e:
+            last_err = e
+    else:
+        try:
+            snapshot_download(
+                repo_id=repo_id,
+                allow_patterns=[f"{subfolder}/adapter_model.*"],
+                cache_dir=cache_dir,
+                token=token,
+            )
+        except Exception as e:
+            raise FileNotFoundError(
+                f"Could not download PEFT weights for {adapter_model_id!r}."
+            ) from (last_err or e)
+
+    refreshed = resolve_peft_adapter_dir(
+        adapter_model_id,
+        cache_dir=cache_dir,
+        token=token,
+    )
+    if refreshed is not None and _peft_adapter_has_weights(refreshed):
+        return refreshed
+    if _peft_adapter_has_weights(adapter_dir):
+        return adapter_dir
+    raise FileNotFoundError(
+        f"PEFT adapter weights still missing for {adapter_model_id!r} under {adapter_dir}."
+    )
+
+
+def _peft_torch_device(device: str | torch.device) -> str:
+    dev = str(device)
+    if dev == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return dev
+
+
+def _load_peft_adapter_on_base(
+    base_model: Any,
+    adapter_dir: Path,
+    *,
+    device: str | torch.device,
+) -> Any:
+    """
+    Attach a local PEFT adapter directory to ``base_model``.
+
+    Avoids ``PeftModel.from_pretrained`` Hub paths that break when only
+    ``adapter_config.json`` is cached (``HFValidationError``) or when ``peft``
+    passes deprecated ``use_auth_token`` to ``huggingface_hub>=1.14``.
+    """
+    from peft import PeftModel
+    from peft.mapping import PEFT_TYPE_TO_CONFIG_MAPPING
+    from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dict
+
+    adapter_cfg = read_peft_adapter_config(adapter_dir)
+    peft_type = str(adapter_cfg.get("peft_type") or "")
+    if peft_type not in PEFT_TYPE_TO_CONFIG_MAPPING:
+        raise ValueError(f"Unsupported peft_type {peft_type!r} in {adapter_dir}")
+
+    config_cls = PEFT_TYPE_TO_CONFIG_MAPPING[peft_type]
+    peft_config = config_cls.from_pretrained(str(adapter_dir))
+    peft_config.inference_mode = True
+    model = PeftModel(base_model, peft_config, adapter_name="default")
+    weights = load_peft_weights(str(adapter_dir), device=_peft_torch_device(device))
+    set_peft_model_state_dict(model, weights, adapter_name="default")
+    return model
+
+
+def _load_processor(
+    model_id: str,
+    *,
+    cache_dir: str,
+    token: str | None,
+    trust_remote_code: bool,
+) -> Any | None:
+    for mid in (model_id,):
+        try:
+            return AutoProcessor.from_pretrained(
+                mid,
+                cache_dir=cache_dir,
+                trust_remote_code=trust_remote_code,
+                token=token,
+            )
+        except Exception:
+            pass
+        try:
+            return AutoTokenizer.from_pretrained(
+                mid,
+                cache_dir=cache_dir,
+                trust_remote_code=trust_remote_code,
+                token=token,
+            )
+        except Exception:
+            pass
+    return None
+
+
+def _build_model_loader_order(model_type: str) -> list[type]:
+    loader_order: list[type] = []
+    if _is_qwen_vl_model_type(model_type):
+        import transformers
+
+        if hasattr(transformers, "Qwen3VLForConditionalGeneration"):
+            loader_order.append(transformers.Qwen3VLForConditionalGeneration)
+        if hasattr(transformers, "Qwen2VLForConditionalGeneration"):
+            loader_order.append(transformers.Qwen2VLForConditionalGeneration)
+    loader_order.extend(
+        [
+            AutoModelForImageTextToText,
+            AutoModelForCausalLM,
+            AutoModel,
+        ]
+    )
+    return loader_order
+
+
+def _load_pretrained_model(
+    model_id: str,
+    *,
+    model_type: str,
+    cache_dir: str,
+    token: str | None,
+    trust_remote_code: bool,
+    dtype: torch.dtype,
+    device: str | torch.device,
+) -> Any:
+    loader_order = _build_model_loader_order(model_type)
+    seen: set[type] = set()
+    last_err: Exception | None = None
+    for loader_cls in loader_order:
+        if loader_cls in seen:
+            continue
+        seen.add(loader_cls)
+        try:
+            load_kw: dict[str, Any] = {
+                "cache_dir": cache_dir,
+                "trust_remote_code": trust_remote_code,
+                "token": token,
+            }
+            load_kw["dtype"] = dtype
+            load_kw["torch_dtype"] = dtype
+            if device != "auto":
+                load_kw["device_map"] = _device_map_arg(device)
+            if _is_qwen_vl_model_type(model_type):
+                load_kw["attn_implementation"] = "sdpa"
+            return loader_cls.from_pretrained(model_id, **load_kw)
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"Failed to load model {model_id!r}: {last_err}") from last_err
+
+
+def _should_merge_peft() -> bool:
+    return os.environ.get("HF_PEFT_MERGE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def load_hf_vlm_peft_adapter(
+    adapter_model_id: str,
+    *,
+    hf_token: str | None = None,
+    device: str | torch.device = "cuda",
+    cache_dir: str | Path | None = None,
+    trust_remote_code: bool = True,
+    base_model_id: str | None = None,
+) -> tuple[Any, Any | None, dict[str, Any]]:
+    """Load base VLM + PEFT LoRA adapter (e.g. surgsigma_qwen3vl_full on Qwen3-VL-4B)."""
+    cache = _hub_cache_dir(cache_dir)
+    token = hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    dtype = _dtype_for_device(device)
+
+    adapter_dir = resolve_peft_adapter_dir(
+        adapter_model_id,
+        cache_dir=cache,
+        token=token,
+    )
+    if adapter_dir is None:
+        raise FileNotFoundError(
+            f"PEFT adapter not found for {adapter_model_id!r} "
+            "(expected adapter_config.json)."
+        )
+
+    adapter_cfg = read_peft_adapter_config(adapter_dir)
+    base_id = (
+        base_model_id
+        or os.environ.get("HF_BASE_MODEL_ID", "").strip()
+        or str(adapter_cfg.get("base_model_name_or_path") or "").strip()
+    )
+    if not base_id:
+        raise ValueError(
+            f"adapter_config.json under {adapter_dir} has no base_model_name_or_path; "
+            "set HF_BASE_MODEL_ID."
+        )
+
+    _ensure_internvl_deps(base_id)
+
+    config = AutoConfig.from_pretrained(
+        base_id,
+        cache_dir=cache,
+        trust_remote_code=trust_remote_code,
+        token=token,
+    )
+    model_type = str(getattr(config, "model_type", "") or "")
+
+    processor = _load_processor(
+        str(adapter_dir),
+        cache_dir=cache,
+        token=token,
+        trust_remote_code=trust_remote_code,
+    )
+    if processor is None:
+        processor = _load_processor(
+            base_id,
+            cache_dir=cache,
+            token=token,
+            trust_remote_code=trust_remote_code,
+        )
+
+    base_model = _load_pretrained_model(
+        base_id,
+        model_type=model_type,
+        cache_dir=cache,
+        token=token,
+        trust_remote_code=trust_remote_code,
+        dtype=dtype,
+        device=device,
+    )
+
+    try:
+        import peft  # noqa: F401
+    except ImportError as e:
+        raise ImportError(
+            "PEFT adapter load requires the `peft` package. "
+            "In your HF_PYTHON env run: pip install peft"
+        ) from e
+
+    adapter_dir = _ensure_peft_adapter_weights(
+        adapter_dir,
+        adapter_model_id,
+        cache_dir=cache,
+        token=token,
+    )
+    model = _load_peft_adapter_on_base(
+        base_model,
+        adapter_dir,
+        device=device,
+    )
+    merged = False
+    if _should_merge_peft():
+        model = model.merge_and_unload()
+        merged = True
+
+    model = _set_eval_mode(model)
+
+    image_side = _infer_default_image_side(processor, config)
+    meta = {
+        "source": "hf_peft_adapter",
+        "hub_model_id": adapter_model_id,
+        "model_id": adapter_model_id,
+        "peft_adapter_dir": str(adapter_dir),
+        "base_model_id": base_id,
+        "peft_type": adapter_cfg.get("peft_type"),
+        "peft_merged": merged,
+        "model_type": model_type,
+        "loader": type(model).__name__,
+        "processor": type(processor).__name__ if processor is not None else None,
+        "image_side": image_side,
+        "bbox_coord_space": "qwen_1000" if _is_qwen_vl_model_type(model_type) else "normalized_01",
+    }
+    return model, processor, meta
+
+
 def _infer_default_image_side(processor: Any, config: Any) -> int:
     for attr in ("image_processor", "video_processor"):
         proc = getattr(processor, attr, None)
@@ -190,6 +601,21 @@ def load_hf_vlm(
     cache = _hub_cache_dir(cache_dir)
     token = hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
     dtype = _dtype_for_device(device)
+
+    adapter_dir = resolve_peft_adapter_dir(
+        model_id,
+        cache_dir=cache,
+        token=token,
+    )
+    if adapter_dir is not None:
+        return load_hf_vlm_peft_adapter(
+            model_id,
+            hf_token=hf_token,
+            device=device,
+            cache_dir=cache_dir,
+            trust_remote_code=trust_remote_code,
+        )
+
     _ensure_internvl_deps(model_id)
 
     if "GR00T" in model_id.upper() or model_id.strip() in ("nvidia/GR00T-H",):
@@ -212,67 +638,23 @@ def load_hf_vlm(
     )
     model_type = str(getattr(config, "model_type", "") or "")
 
-    processor: Any | None = None
-    try:
-        processor = AutoProcessor.from_pretrained(
-            model_id,
-            cache_dir=cache,
-            trust_remote_code=trust_remote_code,
-            token=token,
-        )
-    except Exception:
-        try:
-            processor = AutoTokenizer.from_pretrained(
-                model_id,
-                cache_dir=cache,
-                trust_remote_code=trust_remote_code,
-                token=token,
-            )
-        except Exception:
-            processor = None
-
-    model: Any | None = None
-    loader_order: list[type] = []
-    if _is_qwen_vl_model_type(model_type):
-        import transformers
-
-        if hasattr(transformers, "Qwen3VLForConditionalGeneration"):
-            loader_order.append(transformers.Qwen3VLForConditionalGeneration)
-        if hasattr(transformers, "Qwen2VLForConditionalGeneration"):
-            loader_order.append(transformers.Qwen2VLForConditionalGeneration)
-    loader_order.extend(
-        [
-            AutoModelForImageTextToText,
-            AutoModelForCausalLM,
-            AutoModel,
-        ]
+    processor = _load_processor(
+        model_id,
+        cache_dir=cache,
+        token=token,
+        trust_remote_code=trust_remote_code,
     )
-    seen: set[type] = set()
-    last_err: Exception | None = None
-    for loader_cls in loader_order:
-        if loader_cls in seen:
-            continue
-        seen.add(loader_cls)
-        try:
-            load_kw: dict[str, Any] = {
-                "cache_dir": cache,
-                "trust_remote_code": trust_remote_code,
-                "token": token,
-            }
-            load_kw["dtype"] = dtype
-            load_kw["torch_dtype"] = dtype  # older transformers
-            if device != "auto":
-                load_kw["device_map"] = _device_map_arg(device)
-            if _is_qwen_vl_model_type(model_type):
-                load_kw["attn_implementation"] = "sdpa"
-            model = loader_cls.from_pretrained(model_id, **load_kw)
-            break
-        except Exception as e:
-            last_err = e
-            model = None
 
-    if model is None:
-        raise RuntimeError(f"Failed to load model {model_id!r}: {last_err}") from last_err
+    model = _load_pretrained_model(
+        model_id,
+        model_type=model_type,
+        cache_dir=cache,
+        token=token,
+        trust_remote_code=trust_remote_code,
+        dtype=dtype,
+        device=device,
+    )
+    model = _set_eval_mode(model)
 
     image_side = _infer_default_image_side(processor, config)
     meta = {

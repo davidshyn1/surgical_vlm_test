@@ -23,6 +23,10 @@ export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_CACHE_ROOT/transformers}"
 : "${CHOLEC80_EVAL_ROOT:=$ROOT/../eval/cholec80}"
 : "${CHOLEC80_FRAMES_ROOT:=$CHOLEC80_EVAL_ROOT/frames_0p1fps}"
 : "${ENDOVIS2017_ROOT:=$ROOT/../eval/endovis2017}"
+: "${ENDOVIS18_VQA_ROOT:=$ROOT/../eval/EndoVis-18-VQA}"
+: "${ENDOVIS2018_IMAGES_ROOT:=$ROOT/../eval/endovis2018}"
+: "${ENDOSCAPES_ROOT:=$ROOT/../eval/endoscapes}"
+: "${SARRARP50_ROOT:=$ROOT/../eval/sarrarp50}"
 
 guess_conda_python() {
   local env_name="$1"
@@ -39,6 +43,12 @@ guess_conda_python() {
   done
   return 1
 }
+
+# Default HF interpreter: conda env "surgical" (override with export HF_PYTHON=...)
+if [[ -z "${HF_PYTHON:-}" ]]; then
+  HF_PYTHON="$(guess_conda_python surgical || true)"
+  [[ -n "$HF_PYTHON" ]] && export HF_PYTHON
+fi
 
 is_prismatic_backend() {
   [[ "${1,,}" == "prismatic" ]]
@@ -103,19 +113,17 @@ resolve_backend_python() {
   elif is_api_backend "$backend"; then
     py="${API_PYTHON:-${HF_PYTHON:-}}"
     [[ -z "$py" ]] && py="$(guess_conda_python surgical || true)"
-    [[ -z "$py" ]] && py="$(guess_conda_python appgen || true)"
     [[ -z "$py" && -x "$(command -v python3)" ]] && py="$(command -v python3)"
   else
     py="${HF_PYTHON:-}"
+    [[ -z "$py" ]] && py="$(guess_conda_python surgical || true)"
     [[ -z "$py" && -x "$ROOT/.venv-hf/bin/python" ]] && py="$ROOT/.venv-hf/bin/python"
-    [[ -z "$py" ]] && py="$(guess_conda_python appgen || true)"
-    [[ -z "$py" ]] && py="$(guess_conda_python surgical_vlm || true)"
     [[ -z "$py" && -x "$(command -v python3)" ]] && py="$(command -v python3)"
   fi
   if [[ -z "$py" || ! -x "$py" ]]; then
     echo "ERROR: Python not found for backend '$backend'" >&2
     echo "  prismatic: set PRISMATIC_PYTHON or run setup_backend.sh prismatic" >&2
-    echo "  hf/qwen3/internvl/…: set HF_PYTHON to a transformers-capable interpreter" >&2
+    echo "  hf/qwen3/internvl/…: conda env surgical or export HF_PYTHON=/path/to/python" >&2
     echo "  openai/gemini/claude: set API_PYTHON (lightweight env; needs requests via stdlib only)" >&2
     exit 2
   fi
@@ -137,6 +145,8 @@ Usage:
   BACKEND=<backend> bash grounding_task.sh triplet_recognition_cholect50 [args...]
   BACKEND=<backend> bash grounding_task.sh phase_recognition_cholec80 [args...]
   BACKEND=<backend> bash grounding_task.sh instrument_localization_endovis17 [args...]
+  BACKEND=<backend> bash grounding_task.sh tissue_instrument_recognition_endovis18 [args...]
+  BACKEND=<backend> bash grounding_task.sh cvs_evaluation_endoscapes [args...]
 
 Backends:
   prismatic     TRI-ML prismatic-vlms (local backend package / checkpoint)
@@ -159,7 +169,7 @@ Examples:
     bash grounding_task.sh phase_recognition_cholec80 --video 41
 
 Env:
-  HF_PYTHON                     Python for local HF backends (transformers)
+  HF_PYTHON                     Python for local HF backends (default: conda surgical)
   API_PYTHON                    Python for openai/gemini/claude (default: same as HF_PYTHON)
   PRISMATIC_PYTHON              Python for prismatic backend
   MODEL_ID                      default --model-id when omitted
@@ -180,6 +190,9 @@ case "$task" in
   triplet_recognition_cholect50) script="triplet_recognition_cholect50.py" ;;
   phase_recognition_cholec80) script="phase_recognition_cholec80.py" ;;
   instrument_localization_endovis17) script="instrument_localization_endovis17.py" ;;
+  tissue_instrument_recognition_endovis18) script="tissue_instrument_recognition_endovis18.py" ;;
+  cvs_evaluation_endoscapes) script="cvs_evaluation_endoscapes.py" ;;
+  action_recognition_sarrarp50) script="action_recognition_sarrarp50.py" ;;
   -h|--help|help) usage; exit 0 ;;
   *)
     echo "ERROR: unknown task '$task'" >&2
@@ -211,6 +224,7 @@ repo="$(backend_repo_dir "$backend")"
 set -- "$@" --backend "$backend"
 [[ -n "${MODEL_ID:-}" ]] && ! has_flag "--model-id" "$@" && set -- "$@" --model-id "$MODEL_ID"
 [[ -n "${MODEL_NAME:-}" ]] && ! has_flag "--model-name" "$@" && set -- "$@" --model-name "$MODEL_NAME"
+[[ -n "${API_WORKERS:-}" ]] && ! has_flag "--api-workers" "$@" && set -- "$@" --api-workers "$API_WORKERS"
 
 : "${DEVICE_VISIBLE:=0}"
 export CUDA_VISIBLE_DEVICES="$DEVICE_VISIBLE"
@@ -228,6 +242,19 @@ fi
 
 if [[ "$task" == "instrument_localization_endovis17" ]]; then
   ! has_flag "--dataset-root" "$@" && set -- "$@" --dataset-root "$ENDOVIS2017_ROOT"
+fi
+
+if [[ "$task" == "tissue_instrument_recognition_endovis18" ]]; then
+  ! has_flag "--vqa-root" "$@" && set -- "$@" --vqa-root "$ENDOVIS18_VQA_ROOT"
+  ! has_flag "--images-root" "$@" && set -- "$@" --images-root "$ENDOVIS2018_IMAGES_ROOT"
+fi
+
+if [[ "$task" == "cvs_evaluation_endoscapes" ]]; then
+  ! has_flag "--dataset-root" "$@" && set -- "$@" --dataset-root "$ENDOSCAPES_ROOT"
+fi
+
+if [[ "$task" == "action_recognition_sarrarp50" ]]; then
+  ! has_flag "--dataset-root" "$@" && set -- "$@" --dataset-root "$SARRARP50_ROOT"
 fi
 
 exec uv run --python "$python_bin" "$script" "$@"

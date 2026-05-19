@@ -357,6 +357,7 @@ def load_backend(
     vlm_config: Path | None = None,
     device: str | torch.device = "cuda",
     api_timeout_sec: int = 120,
+    api_workers: int = 1,
 ) -> tuple[VLMBackend, dict[str, Any]]:
     """
     Load a VLM backend.
@@ -377,6 +378,7 @@ def load_backend(
             api_key=api_key,
             api_key_file=api_key_file,
             timeout_sec=api_timeout_sec,
+            api_workers=api_workers,
         )
         return api_backend, meta  # type: ignore[return-value]
     if is_hf_backend(name):

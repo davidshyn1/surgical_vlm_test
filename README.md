@@ -1,7 +1,7 @@
 # surgical_vlm_test
 
-CholecT50 **triplet recognition** · Cholec80 **phase recognition** · EndoVis 2017 **instrument localization** 벤치를 위한 독립 패키지입니다.  
-`surgical_vlm_grounding`과 분리되어 있으며, CholecT50/80은 분류·인식 중심이고 EndoVis 2017만 mask→bbox·시각화를 사용합니다.
+CholecT50 **triplet recognition** · Cholec80 **phase recognition** · EndoVis 2017 **instrument localization** · EndoVis 2018 VQA **tissue/instrument recognition** · Endoscapes **CVS evaluation** 벤치를 위한 독립 패키지입니다.  
+`surgical_vlm_grounding`과 분리되어 있으며, CholecT50/80·EndoVis 18 VQA는 분류·인식(MCQ) 중심이고 EndoVis 2017만 mask→bbox·시각화를 사용합니다.
 
 백엔드 (`backends.py` · `backend_registry.py` · `hf_model_loader.py`):
 
@@ -9,10 +9,11 @@ CholecT50 **triplet recognition** · Cholec80 **phase recognition** · EndoVis 2
 |------|-----------|------|
 | **`prismatic`** | `../backend/prismatic-vlms` + Hub id 또는 로컬 `.pt` + `config.json` | TRI-ML Prismatic 전용 |
 | **`cosmos-*` / `qwen3-*` / `internvl*` / `paligemma*` / `groot`** | Hugging Face Hub → `AutoProcessor` + `model.generate()` | 로컬 GPU **추론(eval)만** |
+| **PEFT LoRA** (`--model-id` = 어댑터 Hub/로컬 경로) | 베이스 VLM + `peft` (`hf_model_loader`) | 예: [surgsigma_qwen3vl_full](https://huggingface.co/khtks/Qwen3-VL/tree/main/surgsigma_qwen3vl_full) |
 | **`openai` / `gpt` / `gemini` / `claude`** | Cloud vision API (`api_backends.py`, JPEG base64) | API 키 필요, GPU 불필요 |
 
 - `cosmos-32b` → `nvidia/Cosmos-Reason2-32B` (Qwen3-VL 계열; `cosmos-reason2` repo venv **불필요**)
-- `qwen3-4b` / `qwen3-32b` → `Qwen/Qwen3-VL-*-Instruct`
+- `qwen3-4b` / `qwen3-32b` → `Qwen/Qwen3-VL-*-Instruct` (풀 weight; LoRA는 `--model-id`로 어댑터 지정)
 - `internvl3.5` → `OpenGVLab/InternVL3_5-38B-HF` (**`-HF` 필수**, custom `InternVL3_5-38B` 아님)
 - `paligemma2` → `google/paligemma2-28b-pt-224` (프롬프트 앞 `<image>` 자동 삽입)
 - 크기·Hub id 전체: `backend_registry.py` · `BACKEND_CHOICES` / `DEFAULT_MODEL_IDS`
@@ -26,7 +27,11 @@ CholecT50 **triplet recognition** · Cholec80 **phase recognition** · EndoVis 2
 | `triplet_recognition_cholect50.py` | CholecT50 triplet 평가 |
 | `phase_recognition_cholec80.py` | Cholec80 phase 평가 |
 | `instrument_localization_endovis17.py` | EndoVis 2017 val instrument bbox localization |
+| `tissue_instrument_recognition_endovis18.py` | EndoVis 2018 VQA Classification MCQ 평가 |
 | `endovis17_data.py` | mask→bbox 샘플 생성·프롬프트 |
+| `endovis18_vqa_data.py` | EndoVis 18 VQA Classification QA·보기·이미지 매핑 |
+| `cvs_evaluation_endoscapes.py` | Endoscapes CVS (yes/no × 3 criteria) |
+| `endoscapes_cvs_data.py` | Endoscapes COCO `ds` → binary GT·샘플 로드 |
 | `scripts/build_endovis2017_bbox_annotations.py` | derived bbox JSON export |
 | `cholect50_data.py` | challenge-val 라벨·프레임 로딩 |
 | `cholec80_data.py` | Cholec80 phase 라벨·비디오 프레임 로딩 |
@@ -165,6 +170,80 @@ If the Large Needle Driver is not in the image, answer exactly: not present
 
 실행 예시는 **§4.1 EndoVis 2017 localization**을 참고하세요.
 
+### EndoVis 2018 VQA — Tissue / Instrument Recognition
+
+**Tissue & instrument recognition** — EndoVis 2018 VQA **Classification** QA를 MCQ로 평가합니다 (논문의 open-vocab BLEU/ROUGE 대신 phase recognition과 동일한 분류 지표).
+
+- **질문**: `eval/EndoVis-18-VQA/seq_*/vqa/Classification/frame*_QA.txt` 의 **모든** `질문|정답` 줄 (프레임당 최대 10문항)
+- **이미지**: `eval/endovis2018/{val|train}/image/seq_{N}_frame{idx}.bmp` (`frame015_QA.txt` → `seq_N_frame015.bmp`)
+- **프롬프트 (MCQ)**: 질문 + 해당 유형별 **키워드 옵션 목록** + **키워드 하나만** 답하도록 지시
+
+**질문 유형 · 보기**
+
+| 유형 | 질문 예 | 옵션 수 |
+|------|---------|--------|
+| organ | What organ is being operated? | 1 (`kidney`) |
+| state | What is the state of {instrument}? | 13 (`Idle`, `Looping`, `Tissue_Manipulation`, …) |
+| location | Where is {instrument} located? | 4 (`left-top`, `right-top`, `left-bottom`, `right-bottom`) |
+
+**프롬프트 예 (state)**
+
+```
+What is the state of bipolar_forceps?
+
+Answer with exactly one keyword from the options below.
+Reply with the keyword only — no extra words, labels, or punctuation.
+
+Options: Idle, Looping, Grasping, Retraction, Tissue_Manipulation, ...
+```
+
+**기대 응답**: `Looping` (옵션 중 키워드 하나)
+
+#### 평가 지표 (`metrics` in JSON)
+
+Cholec80 phase recognition과 동일 (macro는 **support > 0** 클래스만 평균):
+
+- **Accuracy**: QA쌍 전체 exact match
+- **macro_recall** / **macro_precision** / **macro_jaccard** (IoU)
+
+`per_class` breakdown은 JSON에 **포함하지 않습니다**.
+
+#### 데이터 규모 (`--image-split` 기본 `val`)
+
+| split | QA쌍 | 프레임 | 비고 |
+|-------|------|--------|------|
+| `val` (기본) | ~1,396 | ~284 | seq 9·10 위주 + 일부 seq |
+| `train` | ~6,525 | ~995 | |
+| `both` | ~7,921 | ~1,279 | seq 11–16은 이미지 없음 → 제외 |
+
+VLM 호출 수 = QA쌍 수 (질문마다 1회).
+
+실행 예시는 **§4.1 EndoVis 2018 tissue/instrument** · **§3.1**을 참고하세요.
+
+### Endoscapes CVS Evaluation
+
+**Critical View of Safety** — 프레임마다 CVS **3기준**을 **yes/no**로 평가 (Endoscapes2023).
+
+- **GT**: COCO `images[].ds` = `[C1, C2, C3]` (전문가 3명 평균 0~1) → `--gt-threshold 0.5`로 이진화
+- **C1**: Only two tubular structures connect to the gallbladder.
+- **C2**: Hepatocystic triangle cleared for visibility.
+- **C3**: Lower gallbladder detached from liver bed.
+
+| `--eval-protocol` | VLM 호출 | 설명 |
+|-------------------|----------|------|
+| `joint` (기본) | **프레임당 1회** | 3줄 `C1: yes` 형식 |
+| `per_criterion` | **프레임당 3회** | 기준별 MCQ (`yes` / `no`) |
+
+**지표** (논문 C.1.6): **Average Accuracy**, **Balanced Accuracy** (+ `per_criterion` 요약)
+
+| `--split` | 프레임 수 (joint) |
+|-----------|-------------------|
+| `test` (기본) | 312 (CVS201 test) |
+| `val` / `train` | validation / train |
+| `test_seg` / `val_seg` / `train_seg` | 74 / 76 / 343 (Seg50 subset) |
+
+데이터: `eval/endoscapes/{split}/annotation_coco.json` + 동일 폴더의 `.jpg`
+
 ---
 
 ## 3. 사전 준비
@@ -189,6 +268,23 @@ If the Large Needle Driver is not in the image, answer exactly: not present
 - 루트: `<surgical repo>/eval/endovis2017` (`ENDOVIS2017_ROOT`)
 - 매핑: `instrument_type_mapping.json` (class id 1–7 → instrument name)
 - val: `valN/image/seq_X_frameYYY.bmp`, `valN/label/seq_X_frameYYY.bmp` (mask, mode `L`)
+
+**EndoVis 2018 VQA (tissue/instrument recognition)**
+
+| 경로 | 역할 |
+|------|------|
+| `<surgical repo>/eval/EndoVis-18-VQA` (`ENDOVIS18_VQA_ROOT`) | `seq_*/vqa/Classification/frame*_QA.txt` |
+| `<surgical repo>/eval/endovis2018` (`ENDOVIS2018_IMAGES_ROOT`) | `val/image/`, `train/image/` — `seq_{N}_frame{idx}.bmp` |
+
+- QA 파일명 `frame015_QA.txt` → 이미지 `seq_{N}_frame015.bmp` (zero-padding 3자리·무패딩 모두 시도)
+- `EndoVis_18_VQA.csv`는 참고용; eval 스크립트는 Classification QA + bmp만 사용
+
+**Endoscapes (CVS)**
+
+- 루트: `<surgical repo>/eval/endoscapes` (`ENDOSCAPES_ROOT`)
+- split 폴더: `train_seg` / `val_seg` / `test_seg` (Seg50) 또는 `train` / `val` / `test` (CVS201)
+- annotation: `annotation_coco.json` (없으면 `annotation_ds_coco.json`)
+- 이미지: `{split}/{video_id}_{frame}.jpg` · GT: `images[].ds`
 
 ### 3.2 인증 (HF Hub · Cloud API)
 
@@ -224,11 +320,11 @@ bash setup_backend.sh prismatic    # 하나만
 백엔드 repo 기본 경로: `surgical/../backend` (`VLA_ROOT_OVERRIDE`로 변경 가능)
 
 - **prismatic**: `prismatic-vlms/.venv` (`bash setup_backend.sh prismatic`)
-- **HF 모델**: `HF_PYTHON`으로 transformers가 설치된 인터프리터 지정 (conda `appgen`, `surgical` 등). 별도 `cosmos-reason2` / `GR00T-H` repo venv는 **필수 아님**.
+- **HF 모델**: `HF_PYTHON`으로 transformers가 설치된 인터프리터 지정 (기본: conda **`surgical`**). 별도 `cosmos-reason2` / `GR00T-H` repo venv는 **필수 아님**.
 
 ### 3.4 HF Python 환경 (의존성)
 
-`grounding_task.sh`는 `HF_PYTHON`이 없으면 conda `appgen` → `surgical` 순으로 탐색합니다.
+`grounding_task.sh`는 `HF_PYTHON`이 없으면 conda **`surgical`** 을 기본으로 사용합니다.
 
 **공통 (대부분의 HF VLM)**
 
@@ -245,11 +341,80 @@ $HF_PYTHON -m pip install torch transformers accelerate pillow
 | `paligemma2` | (없음) | chat template 없음 → `processor(text, images)` 경로; MCQ 품질은 **mix/instruct** checkpoint 권장 |
 | `groot` | `gr00t` 패키지 (`../backend/GR00T-H`) | Eagle 번들 자동 보정 (`hf_model_loader`) |
 | `cosmos-*` / `qwen3-*` | Qwen3-VL 지원 transformers | bbox localization 시 0–1000 → ÷1000 파싱 |
+| PEFT LoRA adapter (`adapter_config.json`) | **`peft`** | `--model-id`가 어댑터 폴더/Hub 경로면 base 자동 로드 |
 
-**HF_PYTHON 고정 예**
+#### PEFT LoRA 어댑터 (베이스 + adapter 자동 로드)
+
+일부 Hub checkpoint는 **풀 VLM weight가 아니라 LoRA 어댑터만** 올라와 있습니다 (`adapter_config.json`, `adapter_model.safetensors`, tokenizer 등).  
+`hf_model_loader.load_hf_vlm()`은 `adapter_config.json`을 감지하면:
+
+1. `base_model_name_or_path` (또는 `HF_BASE_MODEL_ID`)로 **베이스** `Qwen3VLForConditionalGeneration` 등 로드  
+2. `PeftModel.from_pretrained(base, adapter_dir)` 적용  
+3. `AutoProcessor`는 **어댑터 폴더 우선**, 없으면 베이스에서 로드  
+4. 이후 `HfAutoBackend.generate()` — `BACKEND=qwen3-4b` 등 기존 HF 태스크와 동일
+
+**지원 `MODEL_ID` 형식**
+
+| 형식 | 예 |
+|------|-----|
+| Hub `org/repo/subfolder` | `khtks/Qwen3-VL/surgsigma_qwen3vl_full` |
+| 로컬 디렉터리 | `/path/to/surgsigma_qwen3vl_full` (안에 `adapter_config.json`) |
+
+**의존성**
 
 ```bash
-export HF_PYTHON=/NHNHOME/WORKSPACE/26msit001_T_B/KAIST-AIPRLab/.conda/envs/appgen/bin/python
+export HF_PYTHON=/path/to/env/bin/python
+$HF_PYTHON -m pip install peft
+# 베이스 + 어댑터: torch, transformers, accelerate (공통 HF와 동일)
+```
+
+**실행 예 (SurgSigma Qwen3-VL LoRA on 4B base)**
+
+```bash
+BACKEND=qwen3-4b DEVICE_VISIBLE=0 \
+  MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full \
+  bash grounding_task.sh triplet_recognition_cholect50 \
+    --eval-protocol joint --max-samples 5
+
+# sequential GT (스모크) — 출력은 base(qwen3-vl-4b)와 다른 폴더
+# outputs/.../triplet_qwen3-4b_surgsigma_qwen3vl_full_mcq_sequential_gt/
+BACKEND=qwen3-4b DEVICE_VISIBLE=0 \
+  MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full \
+  bash grounding_task.sh triplet_recognition_cholect50 \
+    --eval-protocol sequential_gt --prompt-mode mcq --video VID68
+```
+
+**환경 변수**
+
+| 변수 | 설명 |
+|------|------|
+| `MODEL_ID` | 어댑터 Hub id 또는 로컬 경로 (`grounding_task.sh`가 `--model-id`로 전달) |
+| `HF_BASE_MODEL_ID` | `adapter_config.json`의 `base_model_name_or_path` 대신 베이스 Hub id 강제 |
+| `HF_PEFT_MERGE` | `1` / `true` 이면 추론 전 `merge_and_unload()` (LoRA를 베이스에 합침, VRAM·속도 trade-off) |
+
+**출력 JSON `vlm_load` 예**
+
+```json
+{
+  "source": "hf_peft_adapter",
+  "hub_model_id": "khtks/Qwen3-VL/surgsigma_qwen3vl_full",
+  "base_model_id": "Qwen/Qwen3-VL-4B-Instruct",
+  "peft_type": "LORA",
+  "peft_merged": false,
+  "loader": "PeftModel"
+}
+```
+
+**주의**
+
+- `BACKEND`는 베이스 **아키텍처**에 맞춰야 합니다 (4B LoRA → `qwen3-4b`, 32B base LoRA → `qwen3-32b`).  
+- 어댑터만 `MODEL_ID`에 넣고 **풀 모델 id**(`Qwen/Qwen3-VL-4B-Instruct`)를 그대로 쓰면 LoRA가 적용되지 않습니다.  
+- `cosmos-reason2` / `prismatic` **repo `.venv`는 불필요** — `HF_PYTHON` + Hub 캐시만 사용.
+
+**HF_PYTHON 고정 예** (기본값과 동일; 다른 env 쓸 때만 명시)
+
+```bash
+export HF_PYTHON=/NHNHOME/WORKSPACE/26msit001_T_B/KAIST-AIPRLab/.conda/envs/surgical/bin/python
 ```
 
 ### 3.5 HF 모델 캐시 (가중치)
@@ -286,6 +451,12 @@ export HF_PYTHON=/NHNHOME/WORKSPACE/26msit001_T_B/KAIST-AIPRLab/.conda/envs/appg
 | `gemini` | `gemini-2.0-flash` | `gemini-2.0-flash` |
 | `claude` / `anthropic` | `claude-sonnet-4-20250514` | `claude-sonnet-4` |
 
+**PEFT 어댑터** — `--model-id`로 어댑터를 지정하고, `--model-name`으로 출력 slug를 지정합니다 (베이스 기본 slug와 별개).
+
+| `--backend` | `--model-id` (예) | `--model-name` (권장 slug) |
+|-------------|-------------------|---------------------------|
+| `qwen3-4b` | `khtks/Qwen3-VL/surgsigma_qwen3vl_full` | `surgsigma-qwen3vl-full` |
+
 별칭: `BACKEND=cosmos2b` → `cosmos-2b`, `BACKEND=qwen3_32b` → `qwen3-32b`.
 
 **InternVL:** Hub id에 **`-HF` suffix** 가 있는 transformers 표준 checkpoint만 `AutoProcessor` 경로와 호환됩니다.  
@@ -301,10 +472,12 @@ export HF_PYTHON=/NHNHOME/WORKSPACE/26msit001_T_B/KAIST-AIPRLab/.conda/envs/appg
 | 모델군 | 입력 조립 |
 |--------|-----------|
 | Qwen-VL, Cosmos, InternVL `-HF` | `processor.apply_chat_template` (user + image) |
+| PEFT LoRA on Qwen3-VL | 베이스와 동일 (`PeftModel` + Qwen chat template) |
 | PaliGemma 등 template 없음 | `processor(text="<image>\n" + prompt, images=...)` |
 | Prismatic | `PurePromptBuilder` + `prismatic.generate` |
 
-공통: 프레임 square resize → `model.generate` → 태스크 파서 → `outputs/...json` (resume 지원).
+공통: 프레임 square resize → `model.generate` → 태스크 파서 → `outputs/...json` (resume 지원).  
+PEFT 경로는 `load_hf_vlm` 진입 시 `adapter_config.json` 유무로 자동 분기 (`load_hf_vlm_peft_adapter`).
 
 ### 3.8 Cholec80 eval frame 준비 (최초 1회)
 
@@ -419,6 +592,18 @@ BACKEND=paligemma2 DEVICE_VISIBLE=0 \
 BACKEND=paligemma2 MODEL_ID=google/paligemma2-10b-mix-448 DEVICE_VISIBLE=0 \
   bash grounding_task.sh triplet_recognition_cholect50 --eval-protocol joint --max-samples 10
 
+# PEFT LoRA (SurgSigma on Qwen3-VL-4B) — pip install peft 필요
+export HF_PYTHON=/path/to/env/bin/python
+$HF_PYTHON -m pip install peft
+BACKEND=qwen3-4b DEVICE_VISIBLE=0 \
+  MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full \
+  MODEL_NAME=surgsigma-qwen3vl-full \
+  bash grounding_task.sh triplet_recognition_cholect50 --eval-protocol joint --max-samples 5
+
+# LoRA merge 후 추론 (선택)
+HF_PEFT_MERGE=1 BACKEND=qwen3-4b MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full \
+  bash grounding_task.sh phase_recognition_cholec80 --video 41 --max-frames-per-video 3
+
 # GPT-4o (OpenAI vision API)
 BACKEND=gpt MODEL_ID=gpt-4o bash grounding_task.sh triplet_recognition_cholect50 \
   --eval-protocol sequential_gt --prompt-mode mcq --video VID68
@@ -511,6 +696,66 @@ bash grounding_task.sh instrument_localization_endovis17 \
 
 **시각화 끄기**: `--no-viz`
 
+#### EndoVis 2018 tissue / instrument recognition
+
+`grounding_task.sh`가 기본 주입:
+
+- `--vqa-root` → `$ENDOVIS18_VQA_ROOT` (`../eval/EndoVis-18-VQA`)
+- `--images-root` → `$ENDOVIS2018_IMAGES_ROOT` (`../eval/endovis2018`)
+- `--image-split val` (스크립트 기본)
+
+**스모크 테스트** (seq 2, 5 QA쌍):
+
+```bash
+BACKEND=qwen2.5 DEVICE_VISIBLE=0 \
+  bash grounding_task.sh tissue_instrument_recognition_endovis18 \
+    --seq 2 --max-samples 5
+```
+
+**Val 전체** (~1,396 VLM 호출):
+
+```bash
+BACKEND=cosmos-32b DEVICE_VISIBLE=0 \
+  bash grounding_task.sh tissue_instrument_recognition_endovis18
+```
+
+**Train + val**:
+
+```bash
+BACKEND=gemini MODEL_ID=gemini-2.0-flash \
+  bash grounding_task.sh tissue_instrument_recognition_endovis18 \
+    --image-split both
+```
+
+**Cloud API 스모크**:
+
+```bash
+BACKEND=gpt MODEL_ID=gpt-4o \
+  bash grounding_task.sh tissue_instrument_recognition_endovis18 \
+    --seq 10 --max-samples 10
+```
+
+#### Endoscapes CVS
+
+```bash
+# 스모크 (test, 3프레임, joint)
+BACKEND=qwen2.5 DEVICE_VISIBLE=0 \
+  bash grounding_task.sh cvs_evaluation_endoscapes \
+    --max-samples 3
+
+# test 전체 (312 VLM calls, joint)
+BACKEND=cosmos-32b DEVICE_VISIBLE=0 \
+  bash grounding_task.sh cvs_evaluation_endoscapes
+
+# 기준별 3회 호출
+BACKEND=prismatic DEVICE_VISIBLE=0 \
+  bash grounding_task.sh cvs_evaluation_endoscapes \
+    --eval-protocol per_criterion --split val_seg
+
+# CVS201 full test split
+bash grounding_task.sh cvs_evaluation_endoscapes --split test --max-samples 20
+```
+
 ### 4.2 Python 직접 실행
 
 **CholecT50**:
@@ -543,6 +788,30 @@ uv run --python ../backend/prismatic-vlms/.venv/bin/python \
   instrument_localization_endovis17.py \
   --backend prismatic \
   --dataset-root ../eval/endovis2017
+```
+
+**EndoVis 2018 VQA**:
+
+```bash
+uv run --python ../backend/prismatic-vlms/.venv/bin/python \
+  tissue_instrument_recognition_endovis18.py \
+  --backend prismatic \
+  --vqa-root ../eval/EndoVis-18-VQA \
+  --images-root ../eval/endovis2018 \
+  --image-split val \
+  --seq 2 --max-samples 5
+```
+
+**PEFT LoRA (SurgSigma Qwen3-VL)** — `HF_PYTHON`에 `peft` 설치 필요:
+
+```bash
+uv run --python /path/to/hf-env/bin/python \
+  triplet_recognition_cholect50.py \
+  --backend qwen3-4b \
+  --model-id khtks/Qwen3-VL/surgsigma_qwen3vl_full \
+  --model-name surgsigma-qwen3vl-full \
+  --eval-protocol joint \
+  --max-samples 5
 ```
 
 ### 4.3 주요 CLI 인자
@@ -589,6 +858,29 @@ uv run --python ../backend/prismatic-vlms/.venv/bin/python \
 | `--viz-only` / `--viz-side` | 시각화만 재생성 |
 | `--force` / `--output` | resume·재추론·결과 경로 |
 
+**EndoVis 2018 VQA (`tissue_instrument_recognition_endovis18.py`)**
+
+| 인자 | 설명 |
+|------|------|
+| `--vqa-root` | `EndoVis-18-VQA` 루트 (기본: `../eval/EndoVis-18-VQA`) |
+| `--images-root` | `endovis2018` 루트 (기본: `../eval/endovis2018`) |
+| `--image-split {val,train,both}` | bmp split (기본: `val`) |
+| `--seq 2` | 단일 sequence (`2` 또는 `seq_2`) |
+| `--max-samples N` | 최대 N개 QA쌍만 평가 |
+| `--force` / `--output` | resume·재추론·결과 경로 |
+
+**Endoscapes CVS (`cvs_evaluation_endoscapes.py`)**
+
+| 인자 | 설명 |
+|------|------|
+| `--dataset-root` | `endoscapes` 루트 (기본: `../eval/endoscapes`) |
+| `--split` | `train` / `val` / `test` / `train_seg` / `val_seg` / `test_seg` (기본: `test`) |
+| `--eval-protocol {joint,per_criterion}` | 1회 vs 기준별 3회 (기본: `joint`) |
+| `--gt-threshold` | `ds[k] >= threshold` → yes (기본 `0.5`) |
+| `--annotation-file` | COCO JSON 이름 override |
+| `--video` | `video_id` 필터 |
+| `--max-samples` | 최대 샘플 수 |
+
 **공통**
 
 | 인자 | 설명 |
@@ -611,6 +903,8 @@ uv run --python ../backend/prismatic-vlms/.venv/bin/python \
 | Triplet | `outputs/triplet_recognition_cholect50/triplet_{backend}_{model}_{prompt_mode}_{eval_protocol}/` | `cholect50_challenge_val_triplet.json` |
 | Phase | `outputs/phase_recognition_cholec80/phase_{backend}_{model}_{split}/` | `cholec80_phase_0p1fps_manifest.json` (eval frames) |
 | EndoVis 2017 | `outputs/instrument_localization_endovis17/loc_{backend}_{model}/` | `endovis2017_instrument_localization.json` |
+| EndoVis 2018 VQA | `outputs/tissue_instrument_recognition_endovis18/tir_{backend}_{model}_mcq_{split}/` | `endovis18_tir_{split}.json` (`split` = `val` / `train` / `both`) |
+| Endoscapes CVS | `outputs/cvs_evaluation_endoscapes/cvs_{backend}_{model}_{protocol}_{split}/` | `endoscapes_cvs_{split}.json` |
 
 **예시 (`BACKEND=cosmos-32b`, triplet, sequential_gt, mcq, eval-all):**
 
@@ -636,6 +930,16 @@ outputs/triplet_recognition_cholect50/
     cholect50_challenge_val_triplet.json
 ```
 
+**예시 (PEFT LoRA, `MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full`)** — 베이스 기본 id와 다르면 Hub subfolder 이름으로 폴더 분리:
+
+```
+outputs/triplet_recognition_cholect50/
+  triplet_qwen3-4b_surgsigma_qwen3vl_full_mcq_sequential_gt/
+    cholect50_challenge_val_triplet.json
+```
+
+(`MODEL_NAME`으로 slug를 덮어쓸 수 있음.)
+
 `--output` / `--output-root`로 경로 override. 동일 JSON으로 재실행 시 **resume**; `--force`로 전부 재추론.
 
 JSON 필드 요약:
@@ -643,7 +947,9 @@ JSON 필드 요약:
 - **triplet** `results[]`: `input` / `output` / `evaluation`; `sequential_*`는 `output.sequential_steps`
 - **triplet** `metrics`: component accuracy, triplet accuracy, mAP
 - **phase** `metrics`: `accuracy`, `macro_recall`, `macro_precision`, `macro_jaccard`, `per_class`
-- **EndoVis** `results[]`: `label_context` (mask bbox GT), `output.parsed` (bbox); `metrics`: mIoU, mAP@50/75, COCO AP
+- **EndoVis 2017** `results[]`: `label_context` (mask bbox GT), `output.parsed` (bbox); `metrics`: mIoU, mAP@50/75, COCO AP
+- **EndoVis 2018 VQA** `results[]`: `label_context` (question, gold_keyword, options), `output.parsed.keyword`; `metrics`: `accuracy`, `macro_recall`, `macro_precision`, `macro_jaccard` (no `per_class`)
+- **Endoscapes CVS** `metrics`: `average_accuracy`, `balanced_accuracy`, `per_criterion` (C1–C3 accuracy/BA); joint은 `evaluation.per_criterion[]`
 
 ---
 
@@ -652,11 +958,13 @@ JSON 필드 요약:
 | 변수 | 설명 |
 |------|------|
 | `BACKEND` | `prismatic` \| `qwen3-32b` \| `cosmos-32b` \| `gpt` \| `gemini` \| `claude` \| … |
-| `API_PYTHON` | Cloud API용 Python (기본: `surgical` / `appgen` / `python3`) |
+| `API_PYTHON` | Cloud API용 Python (기본: `HF_PYTHON` → conda `surgical` / `python3`) |
 | `HF_PYTHON` | non-prismatic 백엔드용 Python (`torch`, `transformers` 필요) |
 | `DEVICE_VISIBLE` | → `CUDA_VISIBLE_DEVICES` (기본 `0`). **철자 주의** (`DEVISE_VISIBLE` 아님) |
-| `MODEL_ID` | `--model-id` 자동 주입 (Hub repo id) |
-| `MODEL_NAME` | `--model-name` 자동 주입 (출력 하위 폴더 slug) |
+| `MODEL_ID` | `--model-id` 자동 주입 (풀 Hub id **또는** PEFT 어댑터 경로) |
+| `MODEL_NAME` | `--model-name` 자동 주입 (출력 slug; 생략 시 `MODEL_ID`가 백엔드 기본과 다르면 Hub tail 사용) |
+| `HF_BASE_MODEL_ID` | PEFT 어댑터의 베이스 Hub id override (`adapter_config`보다 우선) |
+| `HF_PEFT_MERGE` | `1`이면 LoRA `merge_and_unload()` 후 추론 |
 | `HF_HOME` | 기본 `../.cache/huggingface` |
 | `HF_HUB_CACHE` | 기본 `../.cache/huggingface/hub` (가중치 스냅샷) |
 | `CHOLECT50_CHALLENGE_VAL_ROOT` | triplet `--dataset-root` (기본: `../eval/cholect50-challenge-val`) |
@@ -665,6 +973,9 @@ JSON 필드 요약:
 | `CHOLEC80_EVAL_ROOT` | eval 데이터 루트 (기본: `../eval/cholec80`) |
 | `CHOLEC80_FRAMES_ROOT` | phase `--frames-root` (기본: `$CHOLEC80_EVAL_ROOT/frames_0p1fps`) |
 | `ENDOVIS2017_ROOT` | localization `--dataset-root` (기본: `../eval/endovis2017`) |
+| `ENDOVIS18_VQA_ROOT` | tissue/instrument `--vqa-root` (기본: `../eval/EndoVis-18-VQA`) |
+| `ENDOVIS2018_IMAGES_ROOT` | tissue/instrument `--images-root` (기본: `../eval/endovis2018`) |
+| `ENDOSCAPES_ROOT` | CVS `--dataset-root` (기본: `../eval/endoscapes`) |
 | `PRISMATIC_PYTHON` | prismatic venv python override |
 | `GROUNDING_TASK_AUTO_BACKEND_SETUP` | `0`이면 prismatic uv 자동 설치 스킵 |
 
@@ -674,10 +985,11 @@ JSON 필드 요약:
 
 | | **surgical_vlm_test** | **surgical_vlm_grounding** |
 |---|------------------------|------------------------------|
-| 목적 | CholecT50 triplet · Cholec80 phase · EndoVis 2017 bbox eval | Localization, language/visual grounding 등 |
+| 목적 | CholecT50 triplet · Cholec80 phase · EndoVis 2017 bbox · EndoVis 18 VQA MCQ | Localization, language/visual grounding 등 |
 | CholecT50 | `triplet_recognition_cholect50.py` | `localization_cholect50.py`, `language_grounding_v*`, … |
 | Cholec80 | `phase_recognition_cholec80.py` | (별도 phase 스크립트 없음) |
 | EndoVis 2017 | `instrument_localization_endovis17.py` | mask segmentation (별도) |
+| EndoVis 2018 VQA | `tissue_instrument_recognition_endovis18.py` | — |
 | Bbox | EndoVis 2017 mask→bbox + viz | CholecT50 localization 등 |
 | 입력 | T50: 추출 프레임 / C80: `eval/cholec80/frames_0p1fps` PNG+manifest | 주로 추출 프레임 |
 | Triplet | `joint` 1질문/프레임 또는 `sequential_*` 3질문/annotation | multi-step localization |
@@ -698,6 +1010,9 @@ JSON 필드 요약:
 5c. **`apply_chat_template` / no chat template** — PaliGemma: 최신 `backends.py`가 `<image>` prefix + `processor(text, images)` fallback 사용  
 5d. **PaliGemma `<image>` warning** — 동일; 프롬프트 앞 `<image>` 자동 추가됨 (재실행 시 최신 코드 필요)  
 5e. **`TypeError: torch.device is not iterable`** — 최신 `hf_model_loader.py` 사용 (`torch.device` 지원)  
+5f. **PEFT / `No module named peft`** — `HF_PYTHON` env에 `pip install peft`  
+5g. **PEFT load failed / adapter not found** — `MODEL_ID`가 어댑터 디렉터리인지 확인 (`adapter_config.json` 존재). Hub는 `org/repo/subfolder` 형식 (예: `khtks/Qwen3-VL/surgsigma_qwen3vl_full`)  
+5h. **PEFT OOM** — 베이스 4B+LoRA도 GPU 필요; `HF_PEFT_MERGE=1`은 merge 시 추가 메모리 사용 가능  
 6. **HF 401** — `.hf_token` 경로 및 권한  
 6b. **32B / 38B OOM** — `cosmos-32b`, `qwen3-32b`, `internvl3.5`는 VRAM 큼; `--video`, `--max-samples`, `--max-frames-per-video`로 축소  
 6c. **캐시를 못 찾고 재다운로드** — 가중치가 `.../huggingface/models--*`(상위)에만 있으면 `hub/`로 symlink 또는 `HF_HUB_CACHE` 조정 (§3.5)  
@@ -710,10 +1025,15 @@ JSON 필드 요약:
 11. **EndoVis 2017 데이터 없음** — `eval/endovis2017/val*/image`, `val*/label` 확인  
 12. **Qwen-VL / Cosmos bbox** — 0–1000 좌표 → 자동 ÷1000 (`bbox_coord_space=qwen_1000`)  
 13. **EndoVis viz** — `--viz-only` + `endovis2017_instrument_localization.json`
+14. **EndoVis 18 VQA 이미지 없음** — `eval/endovis2018/val/image/seq_N_frameIDX.bmp` 확인; `--image-split both`로 train fallback; seq 11–16은 bmp 없음
+15. **EndoVis 18 VQA 샘플 0개** — `--vqa-root`, `--images-root`, `--seq` 확인
+16. **EndoVis 18 VQA 호출 수** — val 전체 ~1,396회; API 비용·rate limit 주의 (`--max-samples`, `--seq`로 스모크)
 
 ```bash
 python triplet_recognition_cholect50.py --help
 python phase_recognition_cholec80.py --help
 python instrument_localization_endovis17.py --help
+python tissue_instrument_recognition_endovis18.py --help
+python cvs_evaluation_endoscapes.py --help
 bash grounding_task.sh help
 ```
