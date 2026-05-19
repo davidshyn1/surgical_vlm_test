@@ -4,8 +4,10 @@ tissue_instrument_recognition_endovis18.py
 EndoVis 2018 VQA — instrument & tissue recognition (Classification QA, MCQ).
 
   - Questions: all lines in ``vqa/Classification/frame*_QA.txt``
-  - Prompt: question + comma-separated keyword options; answer = one keyword only
-  - Metrics: Accuracy, macro Recall / Precision / Jaccard (IoU) — same as phase recognition
+  - ``--prompt-mode mcq``: question + comma-separated option list in the prompt
+  - ``--prompt-mode ov``: open vocabulary (no options in the prompt)
+  - Metrics: tissue accuracy (Q1 organ), instrument accuracy (Q2–Q4 state/location),
+    tools macro AUROC (Q5 multi-label); Q5 per-sample correct = exact set match (order-free).
 """
 
 from __future__ import annotations
@@ -32,7 +34,9 @@ from endovis18_vqa_data import (
     DEFAULT_IMAGES_ROOT,
     DEFAULT_VQA_ROOT,
     GLOBAL_ANSWER_KEYWORDS,
+    TOOLS_QUESTION,
     collect_classification_samples,
+    discover_instruments,
     options_for_question,
 )
 from triplet_recognition_cholect50 import (
@@ -56,16 +60,62 @@ def _build_name_option_map(options: list[str]) -> dict[str, str]:
     return out
 
 
-def build_recognition_prompt(question: str, options: list[str]) -> tuple[str, dict[str, Any]]:
+def build_recognition_prompt(
+    question: str,
+    options: list[str],
+    *,
+    prompt_mode: str = "mcq",
+    multi_select: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    """
+    Build the user prompt for one VQA sample.
+
+    - ``mcq``: include the option list in the prompt (closed-vocabulary MCQ).
+    - ``ov``: open vocabulary — no options in the prompt; answers are still
+      scored against the sample's option set.
+    """
+    mode = (prompt_mode or "mcq").strip().lower()
     option_map = _build_name_option_map(options)
+    meta: dict[str, Any] = {
+        "prompt_mode": mode,
+        "option_map": option_map,
+        "options": options,
+        "multi_select": multi_select,
+    }
+    q = question.strip()
+
+    if mode == "ov":
+        if multi_select:
+            answer_line = (
+                "Answer with one or more keywords, separated by commas — "
+                "no extra words or labels."
+            )
+        else:
+            answer_line = (
+                "Answer with the keyword only — no extra words, labels, or punctuation."
+            )
+        body = f"{q}\n\n{answer_line}"
+        return body, meta
+
+    if mode != "mcq":
+        raise ValueError(f"Unknown prompt_mode {prompt_mode!r}; choose mcq or ov.")
+
     opts_line = ", ".join(options)
-    body = (
-        f"{question.strip()}\n\n"
-        "Answer with exactly one keyword from the options below. "
-        "Reply with the keyword only — no extra words, labels, or punctuation.\n\n"
-        f"Options: {opts_line}"
-    )
-    return body, {"option_map": option_map, "options": options}
+    if multi_select:
+        body = (
+            f"{q}\n\n"
+            "Answer with one or more keywords from the options below. "
+            "Reply with keywords only, separated by commas — no extra words or labels.\n\n"
+            f"Options: {opts_line}"
+        )
+    else:
+        body = (
+            f"{q}\n\n"
+            "Answer with exactly one keyword from the options below. "
+            "Reply with the keyword only — no extra words, labels, or punctuation.\n\n"
+            f"Options: {opts_line}"
+        )
+    return body, meta
 
 
 def wrap_vlm_prompt(body: str) -> str:
@@ -105,6 +155,43 @@ def parse_keyword_response(
     return {"keyword": pred, "raw": raw}
 
 
+def parse_tools_response(
+    text: str,
+    *,
+    options: list[str],
+    option_map: dict[str, str],
+) -> dict[str, Any]:
+    raw = (text or "").strip()
+    keywords: list[str] = []
+    seen: set[str] = set()
+
+    def _add_hit(hit: str | None) -> None:
+        if not hit:
+            return
+        cid = _canonical(hit)
+        if cid in seen:
+            return
+        seen.add(cid)
+        keywords.append(hit)
+
+    chunks = re.split(r"[,;\n]+", raw) if raw else []
+    for chunk in chunks:
+        s = chunk.strip()
+        s = re.sub(r"^[-*•]\s*", "", s)
+        s = re.sub(r"^\d+[.)]\s*", "", s).strip()
+        if not s:
+            continue
+        _add_hit(_match_option_token(s, option_map, options))
+
+    if not keywords:
+        hits = parse_mcq_terms(raw, options)
+        for hit in hits:
+            _add_hit(hit)
+
+    joined = ", ".join(keywords) if keywords else None
+    return {"keywords": keywords, "keyword": joined, "raw": raw}
+
+
 def _row_key(sample: dict[str, Any]) -> tuple[str, str]:
     tool = (
         f"endovis18-tir|seq_{sample['seq']}|f{int(sample['frame_index']):03d}"
@@ -120,6 +207,41 @@ def _score_record(rec: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(out, dict):
         return None
     parsed = out.get("parsed") or {}
+    qtype = lc.get("question_type")
+
+    if qtype == "tools":
+        gold_list = lc.get("gold_keywords") or []
+        if not gold_list and lc.get("gold_keyword"):
+            gold_list = [
+                k.strip()
+                for k in str(lc["gold_keyword"]).split(",")
+                if k.strip()
+            ]
+        pred_list = parsed.get("keywords") or []
+        if not pred_list and parsed.get("keyword"):
+            pred_list = [
+                k.strip()
+                for k in str(parsed["keyword"]).split(",")
+                if k.strip()
+            ]
+        if not gold_list:
+            return None
+        gold_set = {_canonical(k) for k in gold_list}
+        pred_set = {_canonical(k) for k in pred_list if k}
+        # Order-independent: correct only if predicted set equals gold (no missing/extra).
+        exact_match = gold_set == pred_set
+        return {
+            "question_type": "tools",
+            "gold_keywords": list(gold_list),
+            "pred_keywords": list(pred_list),
+            "gold_keyword": lc.get("gold_keyword"),
+            "pred_keyword": parsed.get("keyword"),
+            "gold_set_ids": sorted(gold_set),
+            "pred_set_ids": sorted(pred_set),
+            "exact_set_match": exact_match,
+            "correct": exact_match,
+        }
+
     gold = str(lc.get("gold_keyword") or "")
     pred = parsed.get("keyword")
     if not gold:
@@ -127,6 +249,7 @@ def _score_record(rec: dict[str, Any]) -> dict[str, Any] | None:
     gold_id = _canonical(gold)
     pred_id = _canonical(pred) if pred else ""
     return {
+        "question_type": qtype,
         "gold_keyword": gold,
         "pred_keyword": pred,
         "gold_keyword_id": gold_id,
@@ -135,52 +258,122 @@ def _score_record(rec: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def aggregate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
-    evs = [r["evaluation"] for r in results if r.get("evaluation")]
-    if not evs:
-        return {"n_results": len(results), "n_scored": 0}
+def _accuracy_block(correct: int, total: int) -> dict[str, Any]:
+    return {
+        "correct": correct,
+        "total": total,
+        "value": (correct / total) if total else None,
+    }
 
-    y_true = [e["gold_keyword_id"] for e in evs]
-    y_pred = [e.get("pred_keyword_id") or "__none__" for e in evs]
 
-    n = len(evs)
-    correct = sum(1 for e in evs if e.get("correct"))
-    accuracy = correct / n if n else None
+def _roc_auc_binary(y_true: list[int], y_score: list[float]) -> float | None:
+    """ROC-AUC via Mann–Whitney U (handles tied scores)."""
+    pos = [s for s, t in zip(y_score, y_true, strict=True) if t == 1]
+    neg = [s for s, t in zip(y_score, y_true, strict=True) if t == 0]
+    if not pos or not neg:
+        return None
+    wins = 0.0
+    for ps in pos:
+        for ns in neg:
+            if ps > ns:
+                wins += 1.0
+            elif ps == ns:
+                wins += 0.5
+    return wins / (len(pos) * len(neg))
 
-    recalls: list[float] = []
-    precisions: list[float] = []
-    jaccards: list[float] = []
 
-    for cid in ANSWER_CLASS_IDS:
-        tp = sum(1 for t, p in zip(y_true, y_pred) if t == cid and p == cid)
-        fp = sum(1 for t, p in zip(y_true, y_pred) if t != cid and p == cid)
-        fn = sum(1 for t, p in zip(y_true, y_pred) if t == cid and p != cid)
-        support = sum(1 for t in y_true if t == cid)
-        if support <= 0:
+def mean_auroc_multilabel(
+    gold_sets: list[set[str]],
+    pred_sets: list[set[str]],
+    classes: list[str],
+) -> float | None:
+    """Macro-averaged AUROC over instrument labels (Q5 multi-label)."""
+    if not gold_sets:
+        return None
+    aucs: list[float] = []
+    for cls in classes:
+        ckey = _canonical(cls)
+        y_true = [1 if ckey in gs else 0 for gs in gold_sets]
+        y_score = [1.0 if ckey in ps else 0.0 for ps in pred_sets]
+        auc = _roc_auc_binary(y_true, y_score)
+        if auc is not None:
+            aucs.append(auc)
+    return sum(aucs) / len(aucs) if aucs else None
+
+
+def aggregate_metrics(
+    results: list[dict[str, Any]],
+    *,
+    instrument_classes: list[str],
+) -> dict[str, Any]:
+    organ_evs: list[dict[str, Any]] = []
+    instrument_evs: list[dict[str, Any]] = []
+    tools_gold_sets: list[set[str]] = []
+    tools_pred_sets: list[set[str]] = []
+    tools_exact_correct = 0
+    tools_n = 0
+
+    for rec in results:
+        ev = rec.get("evaluation")
+        if not ev:
+            continue
+        qtype = ev.get("question_type") or (rec.get("input") or {}).get(
+            "label_context", {}
+        ).get("question_type")
+
+        if qtype == "tools":
+            tools_n += 1
+            if ev.get("correct"):
+                tools_exact_correct += 1
+            gold_ids = ev.get("gold_set_ids")
+            pred_ids = ev.get("pred_set_ids")
+            if gold_ids is not None:
+                tools_gold_sets.append(set(gold_ids))
+            else:
+                tools_gold_sets.append(
+                    {_canonical(k) for k in ev.get("gold_keywords") or []}
+                )
+            if pred_ids is not None:
+                tools_pred_sets.append(set(pred_ids))
+            else:
+                tools_pred_sets.append(
+                    {_canonical(k) for k in ev.get("pred_keywords") or []}
+                )
             continue
 
-        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        jac = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0.0
-        recalls.append(rec)
-        precisions.append(prec)
-        jaccards.append(jac)
+        if qtype == "organ":
+            organ_evs.append(ev)
+        elif qtype in ("state", "location"):
+            instrument_evs.append(ev)
 
-    def _macro(vals: list[float]) -> float | None:
-        return sum(vals) / len(vals) if vals else None
+    n_scored = len(organ_evs) + len(instrument_evs) + tools_n
+    if n_scored == 0:
+        return {"n_results": len(results), "n_scored": 0}
+
+    tissue_correct = sum(1 for e in organ_evs if e.get("correct"))
+    instrument_correct = sum(1 for e in instrument_evs if e.get("correct"))
+    tools_auroc = mean_auroc_multilabel(
+        tools_gold_sets,
+        tools_pred_sets,
+        instrument_classes,
+    )
+
+    all_single_correct = tissue_correct + instrument_correct
+    all_single_n = len(organ_evs) + len(instrument_evs)
 
     return {
         "protocol": "endovis18_tissue_instrument_recognition_mcq",
-        "n_scored": n,
+        "n_scored": n_scored,
         "n_results": len(results),
-        "accuracy": {
-            "correct": correct,
-            "total": n,
-            "value": accuracy,
+        "tissue_accuracy": _accuracy_block(tissue_correct, len(organ_evs)),
+        "instrument_accuracy": _accuracy_block(instrument_correct, len(instrument_evs)),
+        "overall_accuracy": _accuracy_block(all_single_correct, all_single_n),
+        "tools_auroc": {
+            "value": tools_auroc,
+            "n_frames": tools_n,
+            "n_labels": len(instrument_classes),
         },
-        "macro_recall": _macro(recalls),
-        "macro_precision": _macro(precisions),
-        "macro_jaccard": _macro(jaccards),
+        "tools_exact_set_accuracy": _accuracy_block(tools_exact_correct, tools_n),
     }
 
 
@@ -193,7 +386,27 @@ def _should_skip_resume(rec: dict, tool: str) -> bool:
     out = rec.get("output")
     if not isinstance(out, dict):
         return False
-    return bool((out.get("parsed") or {}).get("keyword"))
+    parsed = out.get("parsed") or {}
+    if (inp.get("label_context") or {}).get("question_type") == "tools":
+        return bool(parsed.get("keywords"))
+    return bool(parsed.get("keyword"))
+
+
+def _label_context_from_sample(sample: dict[str, Any]) -> dict[str, Any]:
+    lc: dict[str, Any] = {
+        "seq": sample["seq"],
+        "frame_index": sample["frame_index"],
+        "question": sample["question"],
+        "question_template": sample["question_template"],
+        "question_type": sample["question_type"],
+        "gold_keyword": sample["gold_keyword"],
+        "options": sample["options"],
+    }
+    if sample.get("instrument") is not None:
+        lc["instrument"] = sample["instrument"]
+    if sample.get("gold_keywords") is not None:
+        lc["gold_keywords"] = sample["gold_keywords"]
+    return lc
 
 
 def _generate_vlm_text(
@@ -232,17 +445,9 @@ def _make_result_entry(
         "input": {
             "image_path": path_str,
             "tool": tool,
-            "label_context": {
-                "seq": sample["seq"],
-                "frame_index": sample["frame_index"],
-                "question": sample["question"],
-                "question_template": sample["question_template"],
-                "question_type": sample["question_type"],
-                "gold_keyword": sample["gold_keyword"],
-                "options": sample["options"],
-            },
-            "eval_protocol": "mcq",
-            "prompt_mode": "mcq",
+            "label_context": _label_context_from_sample(sample),
+            "eval_protocol": args.prompt_mode,
+            "prompt_mode": args.prompt_mode,
             "user_prompt": user_prompt,
         },
         "output": None,
@@ -273,6 +478,12 @@ def parse_args() -> argparse.Namespace:
         help="Which EndoVis2018 image split to use (default: val).",
     )
     p.add_argument("--seq", type=str, default=None, help="Evaluate one sequence only, e.g. 2 or seq_2.")
+    p.add_argument(
+        "--prompt-mode",
+        choices=("mcq", "ov"),
+        default="mcq",
+        help="mcq: include option lists in the prompt; ov: open vocabulary (no options shown).",
+    )
     p.add_argument("--max-samples", type=int, default=None)
     p.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     p.add_argument("--output", type=Path, default=None)
@@ -323,7 +534,7 @@ def main() -> None:
         if args.output is not None
         else (
             out_root
-            / f"tir_{args.backend}_{model_name}_mcq_{split_slug}"
+            / f"tir_{args.backend}_{model_name}_{args.prompt_mode}_{split_slug}"
             / f"endovis18_tir_{split_slug}.json"
         ).resolve()
     )
@@ -332,7 +543,8 @@ def main() -> None:
     n_seq = len({s["seq"] for s in samples})
     print(
         f"EndoVis18 tissue/instrument recognition: seq={n_seq}, frames={n_frames}, "
-        f"qa_pairs={len(samples)}, image_split={args.image_split}.",
+        f"qa_pairs={len(samples)}, image_split={args.image_split}, "
+        f"prompt_mode={args.prompt_mode}.",
         file=sys.stderr,
     )
 
@@ -365,22 +577,20 @@ def main() -> None:
         ):
             rec = results[key_to_idx[row_key]]
             inp = rec.setdefault("input", {})
-            inp["label_context"] = {
-                "seq": sample["seq"],
-                "frame_index": sample["frame_index"],
-                "question": sample["question"],
-                "question_template": sample["question_template"],
-                "question_type": sample["question_type"],
-                "gold_keyword": sample["gold_keyword"],
-                "options": sample["options"],
-            }
+            inp["label_context"] = _label_context_from_sample(sample)
             ev = _score_record(rec)
             if ev:
                 rec["evaluation"] = ev
             continue
 
         options = sample["options"]
-        user_prompt, prompt_meta = build_recognition_prompt(sample["question"], options)
+        multi_select = sample.get("question_type") == "tools"
+        user_prompt, prompt_meta = build_recognition_prompt(
+            sample["question"],
+            options,
+            prompt_mode=args.prompt_mode,
+            multi_select=multi_select,
+        )
         option_map = prompt_meta["option_map"]
 
         try:
@@ -391,11 +601,18 @@ def main() -> None:
                 user_prompt=user_prompt,
                 args=args,
             )
-            parsed = parse_keyword_response(
-                text,
-                options=options,
-                option_map=option_map,
-            )
+            if multi_select:
+                parsed = parse_tools_response(
+                    text,
+                    options=options,
+                    option_map=option_map,
+                )
+            else:
+                parsed = parse_keyword_response(
+                    text,
+                    options=options,
+                    option_map=option_map,
+                )
             frame_output = {"text": text, "parsed": parsed}
             vlm_calls += 1
         except Exception as e:
@@ -425,10 +642,12 @@ def main() -> None:
             if ev:
                 rec["evaluation"] = ev
 
-    metrics = aggregate_metrics(results)
+    instrument_opts = list(discover_instruments(vqa_root))
+    metrics = aggregate_metrics(results, instrument_classes=instrument_opts)
     payload = {
         "task": "tissue_instrument_recognition",
-        "eval_protocol": "endovis18_classification_mcq",
+        "eval_protocol": f"endovis18_classification_{args.prompt_mode}",
+        "prompt_mode": args.prompt_mode,
         "dataset": "EndoVis-18-VQA",
         "vqa_root": str(vqa_root),
         "images_root": str(images_root),
@@ -441,10 +660,24 @@ def main() -> None:
         "answer_classes": list(GLOBAL_ANSWER_KEYWORDS),
         "answer_class_ids": list(ANSWER_CLASS_IDS),
         "question_templates": {
-            "organ": {"question": "What organ is being operated?", "options": list(options_for_question("What organ is being operated?"))},
-            "state": {"question": "What is the state of {instrument}?", "options": list(options_for_question("What is the state of bipolar_forceps?"))},
-            "location": {"question": "Where is {instrument} located?", "options": list(options_for_question("Where is bipolar_forceps located?"))},
+            "organ": {
+                "question": "What organ is being operated?",
+                "options": list(options_for_question("What organ is being operated?")),
+            },
+            "state": {
+                "question": "What is the state of {instrument}?",
+                "options": list(options_for_question("What is the state of bipolar_forceps?")),
+            },
+            "location": {
+                "question": "Where is {instrument} located?",
+                "options": list(options_for_question("Where is bipolar_forceps located?")),
+            },
+            "tools": {
+                "question": TOOLS_QUESTION,
+                "options": instrument_opts,
+            },
         },
+        "instrument_options": instrument_opts,
         "vlm_forward_passes": vlm_calls,
         "metrics": metrics,
         "count": len(results),
@@ -455,13 +688,16 @@ def main() -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
     m = metrics
-    acc = (m.get("accuracy") or {}).get("value")
+    tissue = (m.get("tissue_accuracy") or {}).get("value")
+    inst = (m.get("instrument_accuracy") or {}).get("value")
+    tools_auc = (m.get("tools_auroc") or {}).get("value")
+    tools_exact = (m.get("tools_exact_set_accuracy") or {}).get("value")
     print(
         f"Wrote {len(results)} entries to {out_path}\n"
-        f"  Accuracy={acc}\n"
-        f"  Macro Recall={m.get('macro_recall')}  "
-        f"Precision={m.get('macro_precision')}  "
-        f"Jaccard={m.get('macro_jaccard')}",
+        f"  Tissue accuracy (Q1)={tissue}\n"
+        f"  Instrument accuracy (Q2–Q4)={inst}\n"
+        f"  Tools macro AUROC (Q5)={tools_auc}\n"
+        f"  Tools exact-set accuracy (Q5)={tools_exact}",
         file=sys.stderr,
     )
 
