@@ -339,7 +339,7 @@ def _load_prismatic(
     run_dir = _resolve_prismatic_run_dir(vlm_checkpoint, vlm_config)
 
     if run_dir is not None:
-        vlm = prismatic_load.load(run_dir, hf_token=hf_token, cache_dir=cache_dir)
+        vlm = prismatic_load(run_dir, hf_token=hf_token, cache_dir=cache_dir)
         meta = {
             "source": "prismatic_checkpoint",
             "run_dir": str(run_dir),
@@ -349,7 +349,7 @@ def _load_prismatic(
             "bbox_coord_space": "normalized_01",
         }
     else:
-        vlm = prismatic_load.load(model_id, hf_token=hf_token, cache_dir=cache_dir)
+        vlm = prismatic_load(model_id, hf_token=hf_token, cache_dir=cache_dir)
         meta = {
             "source": "prismatic_hub",
             "model_id": model_id,
