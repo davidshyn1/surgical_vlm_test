@@ -27,7 +27,8 @@ from backend_registry import (
     normalize_backend_key,
     resolve_model_id,
 )
-from hf_model_loader import load_hf_vlm
+# hf_model_loader needs transformers>=4.45 (AutoModelForImageTextToText).
+# Lazy-import in _load_hf so prismatic's pinned transformers 4.38.x venv can start.
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _BACKEND_ROOT = _REPO_ROOT / "backend"
@@ -381,6 +382,8 @@ def _load_hf(
     hf_token: str | None,
     device: str | torch.device,
 ) -> tuple[VLMBackend, dict[str, Any]]:
+    from hf_model_loader import load_hf_vlm
+
     model, processor, meta = load_hf_vlm(
         model_id,
         hf_token=hf_token,

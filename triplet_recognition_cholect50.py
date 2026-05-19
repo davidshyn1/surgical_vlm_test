@@ -644,6 +644,126 @@ def mean_ap_multilabel(
     return sum(aps) / len(aps) if aps else None
 
 
+def _class_tp_fp_fn(
+    gold_sets: list[set[str]],
+    pred_sets: list[set[str]],
+    ckey: str,
+) -> tuple[int, int, int]:
+    tp = fp = fn = 0
+    for gs, ps in zip(gold_sets, pred_sets, strict=True):
+        in_g = ckey in gs
+        in_p = ckey in ps
+        if in_g and in_p:
+            tp += 1
+        elif in_p:
+            fp += 1
+        elif in_g:
+            fn += 1
+    return tp, fp, fn
+
+
+def macro_precision_recall_multilabel(
+    gold_sets: list[set[str]],
+    pred_sets: list[set[str]],
+    classes: list[str],
+    *,
+    min_support: int = 1,
+) -> dict[str, float | None]:
+    """
+  Macro-averaged precision / recall over vocabulary classes (support >= min_support).
+
+  Per class: TP = in both gold and pred sets for a sample; FP = in pred only; FN = in gold only.
+    """
+    precs: list[float] = []
+    recs: list[float] = []
+    for cls in classes:
+        ckey = _canonical(cls)
+        tp, fp, fn = _class_tp_fp_fn(gold_sets, pred_sets, ckey)
+        support = tp + fn
+        if support < min_support:
+            continue
+        if tp + fp > 0:
+            precs.append(tp / (tp + fp))
+        if tp + fn > 0:
+            recs.append(tp / (tp + fn))
+    return {
+        "macro_precision": sum(precs) / len(precs) if precs else None,
+        "macro_recall": sum(recs) / len(recs) if recs else None,
+        "n_classes_scored": len(precs),
+    }
+
+
+def component_accuracy(gold_sets: list[set[str]], pred_sets: list[set[str]]) -> float | None:
+    """Fraction of samples where the gold label (singleton set) is contained in pred set."""
+    if not gold_sets:
+        return None
+    ok = sum(1 for gs, ps in zip(gold_sets, pred_sets, strict=True) if gs and gs <= ps)
+    return ok / len(gold_sets)
+
+
+def triplet_sample_pr_metrics(evs: list[dict[str, Any]]) -> dict[str, float | None]:
+    """
+    Per-annotation triplet metrics (one gold triplet per sample).
+
+    - accuracy / recall: any predicted triplet equals gold (inst, verb, target)
+    - precision: (# predicted triplets matching gold) / |predicted triplets|
+    """
+    if not evs:
+        return {"accuracy": None, "precision": None, "recall": None}
+
+    accs: list[float] = []
+    precs: list[float] = []
+    recs: list[float] = []
+
+    for e in evs:
+        g_inst = _canonical(e.get("gold_instrument"))
+        g_verb = _canonical(e.get("gold_verb"))
+        g_tgt = _canonical(e.get("gold_target"))
+        if not (g_inst and g_verb and g_tgt):
+            continue
+        gold_t = (g_inst, g_verb, g_tgt)
+
+        pred_triples: set[tuple[str, str, str]] = set()
+        for t in e.get("pred_triplets") or []:
+            if not isinstance(t, dict):
+                continue
+            pi = _canonical(t.get("instrument"))
+            pv = _canonical(t.get("verb"))
+            pt = _canonical(t.get("target"))
+            if pi and pv and pt:
+                pred_triples.add((pi, pv, pt))
+
+        hit = gold_t in pred_triples
+        recs.append(1.0 if hit else 0.0)
+        accs.append(1.0 if hit else 0.0)
+        if pred_triples:
+            n_match = sum(1 for p in pred_triples if p == gold_t)
+            precs.append(n_match / len(pred_triples))
+        else:
+            precs.append(0.0)
+
+    if not accs:
+        return {"accuracy": None, "precision": None, "recall": None}
+    return {
+        "accuracy": sum(accs) / len(accs),
+        "precision": sum(precs) / len(precs),
+        "recall": sum(recs) / len(recs),
+    }
+
+
+def component_pr_block(
+    gold_sets: list[set[str]],
+    pred_sets: list[set[str]],
+    classes: list[str],
+) -> dict[str, float | None]:
+    pr = macro_precision_recall_multilabel(gold_sets, pred_sets, classes)
+    return {
+        "accuracy": component_accuracy(gold_sets, pred_sets),
+        "precision": pr["macro_precision"],
+        "recall": pr["macro_recall"],
+    }
+
+
 def _label_context_from_parsed(parsed: dict[str, Any]) -> dict[str, Any]:
     return {
         "triplet_id": parsed["triplet_id"],
@@ -757,6 +877,27 @@ def aggregate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
     protocol_label = next(iter(protocols)) if len(protocols) == 1 else "cholect50_triplet_recognition"
 
+    inst_pr = macro_precision_recall_multilabel(inst_gold, inst_pred, INSTRUMENT_OPTIONS)
+    verb_pr = macro_precision_recall_multilabel(verb_gold, verb_pred, VERB_OPTIONS)
+    tgt_pr = macro_precision_recall_multilabel(tgt_gold, tgt_pred, TARGET_OPTIONS)
+    trip_block = triplet_sample_pr_metrics(evs)
+
+    inst_block = {
+        "accuracy": acc_block("instrument_correct")["accuracy"],
+        "precision": inst_pr["macro_precision"],
+        "recall": inst_pr["macro_recall"],
+    }
+    verb_block = {
+        "accuracy": acc_block("verb_correct")["accuracy"],
+        "precision": verb_pr["macro_precision"],
+        "recall": verb_pr["macro_recall"],
+    }
+    tgt_block = {
+        "accuracy": acc_block("target_correct")["accuracy"],
+        "precision": tgt_pr["macro_precision"],
+        "recall": tgt_pr["macro_recall"],
+    }
+
     return {
         "protocol": protocol_label,
         "instrument_accuracy": acc_block("instrument_correct"),
@@ -766,6 +907,10 @@ def aggregate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
         "instrument_mAP": mean_ap_multilabel(inst_gold, inst_pred, INSTRUMENT_OPTIONS),
         "verb_mAP": mean_ap_multilabel(verb_gold, verb_pred, VERB_OPTIONS),
         "target_mAP": mean_ap_multilabel(tgt_gold, tgt_pred, TARGET_OPTIONS),
+        "instrument": inst_block,
+        "verb": verb_block,
+        "target": tgt_block,
+        "triplet": trip_block,
         "n_results": len(results),
         "n_scored": len(evs),
     }
@@ -1412,7 +1557,9 @@ def main() -> None:
         f"mAP={m.get('verb_mAP')}\n"
         f"  Target Acc={m.get('target_accuracy', {}).get('accuracy')}  "
         f"mAP={m.get('target_mAP')}\n"
-        f"  Triplet Acc={m.get('triplet_accuracy', {}).get('accuracy')}",
+        f"  Triplet Acc={m.get('triplet_accuracy', {}).get('accuracy')}\n"
+        f"  Instrument P/R={m.get('instrument', {}).get('precision')}/"
+        f"{m.get('instrument', {}).get('recall')}",
         file=sys.stderr,
     )
 
