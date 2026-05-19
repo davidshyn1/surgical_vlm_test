@@ -154,6 +154,62 @@ def extract_frame_rgb(
     return read_video_frame_rgb_opencv(video_path, frame_index)
 
 
+def extract_frames_batch_ffmpeg(
+    video_path: Path,
+    frame_indices: list[int],
+    out_dir: Path,
+) -> list[Path]:
+    """Extract many frames in one ffmpeg invocation; returns written paths in order."""
+    from PIL import Image
+
+    if not frame_indices:
+        return []
+    if not ffmpeg_available():
+        raise RuntimeError("ffmpeg not found on PATH.")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    select_expr = "+".join(f"eq(n\\,{int(n)})" for n in frame_indices)
+    tmp_pattern = out_dir / "_tmp_%09d.png"
+    for old in out_dir.glob("_tmp_*.png"):
+        old.unlink(missing_ok=True)
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+        "-vf",
+        f"select={select_expr}",
+        "-vsync",
+        "vfr",
+        str(tmp_pattern),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, check=False)
+    if proc.returncode != 0:
+        err = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise OSError(
+            f"ffmpeg batch extract failed for {video_path}"
+            + (f": {err}" if err else "")
+        )
+
+    tmp_files = sorted(out_dir.glob("_tmp_*.png"))
+    if len(tmp_files) != len(frame_indices):
+        raise OSError(
+            f"ffmpeg wrote {len(tmp_files)} frames, expected {len(frame_indices)} "
+            f"for {video_path}"
+        )
+
+    written: list[Path] = []
+    for src, frame_index in zip(tmp_files, frame_indices, strict=True):
+        dest = out_dir / f"{int(frame_index):09d}.png"
+        Image.open(src).convert("RGB").save(dest)
+        src.unlink(missing_ok=True)
+        written.append(dest)
+    return written
+
+
 def write_manifest_row(
     fh: Any,
     *,
@@ -206,32 +262,37 @@ def extract_video_frames(
     n_missing_action = 0
     manifest_out = manifest_path(video_dir)
 
-    with manifest_out.open("w", encoding="utf-8") as mf:
-        for frame_index in frame_indices:
-            action_id = lookup_action_at_frame(action_map, frame_index)
-            if action_id is None:
-                n_missing_action += 1
-                continue
+    labeled_indices: list[tuple[int, int]] = []
+    for frame_index in frame_indices:
+        action_id = lookup_action_at_frame(action_map, frame_index)
+        if action_id is None:
+            n_missing_action += 1
+            continue
+        labeled_indices.append((frame_index, action_id))
 
-            dest = frame_png_path(video_dir, frame_index)
-            if dest.is_file() and not overwrite:
-                write_manifest_row(
-                    mf,
-                    vid=video_dir.name,
-                    vid_num=vid_num,
-                    frame_index=frame_index,
-                    action_id=action_id,
-                    img_path=dest,
+    to_extract = [
+        frame_index
+        for frame_index, _ in labeled_indices
+        if overwrite or not frame_png_path(video_dir, frame_index).is_file()
+    ]
+
+    if to_extract:
+        if ffmpeg_available() and (frame_reader or "auto") != "opencv":
+            extract_frames_batch_ffmpeg(video_path, to_extract, frames_dir)
+        else:
+            for frame_index in to_extract:
+                image = extract_frame_rgb(
+                    video_path,
+                    frame_index,
+                    frame_reader=frame_reader,
                 )
-                n_written += 1
-                continue
+                save_frame_png(image, frame_png_path(video_dir, frame_index))
 
-            image = extract_frame_rgb(
-                video_path,
-                frame_index,
-                frame_reader=frame_reader,
-            )
-            save_frame_png(image, dest)
+    with manifest_out.open("w", encoding="utf-8") as mf:
+        for frame_index, action_id in labeled_indices:
+            dest = frame_png_path(video_dir, frame_index)
+            if not dest.is_file():
+                continue
             write_manifest_row(
                 mf,
                 vid=video_dir.name,

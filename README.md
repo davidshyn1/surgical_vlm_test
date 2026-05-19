@@ -1,6 +1,6 @@
 # surgical_vlm_test
 
-CholecT50 **triplet recognition** · Cholec80 **phase recognition** · EndoVis 2017 **instrument localization** · EndoVis 2018 VQA **tissue/instrument recognition** · Endoscapes **CVS evaluation** 벤치를 위한 독립 패키지입니다.  
+CholecT50 **triplet recognition** · Cholec80 **phase recognition** · SAR-RARP50 **action recognition** · EndoVis 2017 **instrument localization** · EndoVis 2018 VQA **tissue/instrument recognition** · Endoscapes **CVS evaluation** 벤치를 위한 독립 패키지입니다.  
 `surgical_vlm_grounding`과 분리되어 있으며, CholecT50/80·EndoVis 18 VQA는 분류·인식(MCQ) 중심이고 EndoVis 2017만 mask→bbox·시각화를 사용합니다.
 
 백엔드 (`backends.py` · `backend_registry.py` · `hf_model_loader.py`):
@@ -26,6 +26,8 @@ CholecT50 **triplet recognition** · Cholec80 **phase recognition** · EndoVis 2
 |------|------|
 | `triplet_recognition_cholect50.py` | CholecT50 triplet 평가 |
 | `phase_recognition_cholec80.py` | Cholec80 phase 평가 |
+| `action_recognition_sarrarp50.py` | SAR-RARP50 needle/suture action MCQ (segmentation-indexed frames) |
+| `sarrarp50_data.py` | segmentation stem → frame index, `action_discrete.txt`, PNG 추출·샘플 수집 |
 | `instrument_localization_endovis17.py` | EndoVis 2017 val instrument bbox localization |
 | `tissue_instrument_recognition_endovis18.py` | EndoVis 2018 VQA Classification MCQ 평가 |
 | `endovis17_data.py` | mask→bbox 샘플 생성·프롬프트 |
@@ -33,7 +35,7 @@ CholecT50 **triplet recognition** · Cholec80 **phase recognition** · EndoVis 2
 | `cvs_evaluation_endoscapes.py` | Endoscapes CVS (yes/no × 3 criteria) |
 | `endoscapes_cvs_data.py` | Endoscapes COCO `ds` → binary GT·샘플 로드 |
 | `scripts/build_endovis2017_bbox_annotations.py` | derived bbox JSON export |
-| `cholect50_data.py` | challenge-val 라벨·프레임 로딩 |
+| `cholect50_data.py` | challenge-val 라벨·프레임 로딩 · 공용 `infer_pil_side()` |
 | `cholec80_data.py` | Cholec80 phase 라벨·비디오 프레임 로딩 |
 | `utils.py` | 라벨 파싱, bbox/IoU/mAP, resume, 시각화 |
 | `backends.py` | VLM 로드·추론 (Prismatic / HF Auto) |
@@ -44,6 +46,7 @@ CholecT50 **triplet recognition** · Cholec80 **phase recognition** · EndoVis 2
 | `setup_backend.sh` | **prismatic** `.venv` 설치 (uv) |
 | `scripts/extract_cholec80_frames.sh` | Cholec80 0.1 fps 프레임 추출 → `../eval/cholec80/frames_0p1fps` |
 | `scripts/build_cholec80_eval_phase_annotations.py` | eval frame용 `videoNN-phase.txt` manifest 생성 |
+| `scripts/extract_sarrarp50_frames.py` | SAR-RARP50 segmentation 인덱스에서 PNG 추출 → `video_xx/frames/` |
 
 ---
 
@@ -244,6 +247,40 @@ VLM 호출 수 = QA쌍 수 (질문마다 1회).
 
 데이터: `eval/endoscapes/{split}/annotation_coco.json` + 동일 폴더의 `.jpg`
 
+### SAR-RARP50 Action Recognition
+
+**Needle/suture action recognition** — segmentation 마스크가 있는 프레임(1 Hz 샘플링)에서 수술자 동작 8-class를 MCQ로 분류합니다.
+
+- **데이터**: `<surgical repo>/eval/sarrarp50/video_XX/`
+  - `video_left.avi` — 좌안 카메라
+  - `segmentation/000000060.png` — 파일명 stem = **AVI 0-based frame index**
+  - `action_discrete.txt` — `frame_index,action_id` (10 Hz GT, stem과 동일 인덱스)
+- **전처리 (필수 1회)**: `scripts/extract_sarrarp50_frames.py` → `video_XX/frames/{index:09d}.png` + `action_samples.jsonl`
+- **평가**: `action_recognition_sarrarp50.py` — PNG + GT로 VLM MCQ → accuracy / macro recall·precision·jaccard
+- **8 actions** (id 0–7): Other, Picking-up the needle, Positioning the needle tip, Pushing through tissue, Pulling out, Tying a knot, Cutting the suture, Returning/dropping the needle
+
+**프롬프트 (MCQ)**
+
+```
+What Action related to the needle and suture is the surgeon focusing on right now?
+The available action options are:
+A. Other
+B. Picking-up the needle
+...
+```
+
+**파이프라인**
+
+```
+segmentation/*.png  →  frame index 목록
+       ↓
+extract_sarrarp50_frames.py  (ffmpeg/opencv → frames/*.png)
+       ↓
+action_recognition_sarrarp50.py  (VLM → JSON)
+```
+
+실행 예시는 **§3.9** · **§4.1 SAR-RARP50**을 참고하세요.
+
 ---
 
 ## 3. 사전 준비
@@ -285,6 +322,17 @@ VLM 호출 수 = QA쌍 수 (질문마다 1회).
 - split 폴더: `train_seg` / `val_seg` / `test_seg` (Seg50) 또는 `train` / `val` / `test` (CVS201)
 - annotation: `annotation_coco.json` (없으면 `annotation_ds_coco.json`)
 - 이미지: `{split}/{video_id}_{frame}.jpg` · GT: `images[].ds`
+
+**SAR-RARP50 (action recognition)**
+
+| 경로 | 역할 |
+|------|------|
+| `<surgical repo>/eval/sarrarp50` (`SARRARP50_ROOT`) | `video_41/`, `video_42/`, … |
+| `video_XX/video_left.avi` | 소스 영상 |
+| `video_XX/segmentation/*.png` | 평가 대상 frame index (stem = native frame #) |
+| `video_XX/action_discrete.txt` | frame별 action class GT |
+| `video_XX/frames/*.png` | **추출 후** eval 입력 (`extract_sarrarp50_frames.py`) |
+| `video_XX/frames/action_samples.jsonl` | 추출 manifest (vid, frame_index, action_id, img_path) |
 
 ### 3.2 인증 (HF Hub · Cloud API)
 
@@ -477,6 +525,7 @@ export HF_PYTHON=/NHNHOME/WORKSPACE/26msit001_T_B/KAIST-AIPRLab/.conda/envs/surg
 | Prismatic | `PurePromptBuilder` + `prismatic.generate` |
 
 공통: 프레임 square resize → `model.generate` → 태스크 파서 → `outputs/...json` (resume 지원).  
+HF 로드 직후 `model.eval()` 호출 (`hf_model_loader._set_eval_mode`).  
 PEFT 경로는 `load_hf_vlm` 진입 시 `adapter_config.json` 유무로 자동 분기 (`load_hf_vlm_peft_adapter`).
 
 ### 3.8 Cholec80 eval frame 준비 (최초 1회)
@@ -507,6 +556,38 @@ bash grounding_task.sh phase_recognition_cholec80
 # MP4에서 직접 (추출본 없을 때만)
 bash grounding_task.sh phase_recognition_cholec80 --frame-stride 250
 ```
+
+### 3.9 SAR-RARP50 frame 추출 (최초 1회)
+
+VLM 평가 전에 segmentation 인덱스에 맞춰 PNG를 뽑아 둡니다. `action_recognition_sarrarp50.py`는 **`frames/*.png`가 없으면 시작하지 않습니다.**
+
+```bash
+cd surgical_vlm_test
+
+# 전체 video_* (기본 dataset-root: ../eval/sarrarp50)
+python scripts/extract_sarrarp50_frames.py --dataset-root ../eval/sarrarp50
+
+# 단일 영상
+python scripts/extract_sarrarp50_frames.py --dataset-root ../eval/sarrarp50 --video 41
+
+# 기존 PNG 덮어쓰기
+python scripts/extract_sarrarp50_frames.py --dataset-root ../eval/sarrarp50 --overwrite
+```
+
+**출력 레이아웃**
+
+```
+eval/sarrarp50/video_41/
+  video_left.avi
+  segmentation/000000060.png
+  action_discrete.txt
+  frames/
+    000000060.png
+    action_samples.jsonl    # 한 줄 = JSON {vid, frame_index, action_id, img_path, ...}
+```
+
+- `action_discrete.txt`에 라벨이 없는 segmentation stem은 건너뜀 (`missing_action` 로그)
+- ffmpeg 배치 추출 우선 (`cholec80_data`의 `FrameReader` 재사용); 없으면 프레임별 opencv/ffmpeg
 
 ---
 
@@ -756,6 +837,46 @@ BACKEND=prismatic DEVICE_VISIBLE=0 \
 bash grounding_task.sh cvs_evaluation_endoscapes --split test --max-samples 20
 ```
 
+#### SAR-RARP50 action recognition
+
+`grounding_task.sh`가 기본 `--dataset-root`를 `../eval/sarrarp50` (`SARRARP50_ROOT`)로 설정합니다.
+
+**1) 프레임 추출 (최초 1회, VLM 전 필수)**
+
+```bash
+python scripts/extract_sarrarp50_frames.py --dataset-root ../eval/sarrarp50
+```
+
+**2) VLM 평가**
+
+```bash
+# 스모크 (단일 video, 샘플 수 제한)
+BACKEND=qwen3-4b DEVICE_VISIBLE=0 \
+  bash grounding_task.sh action_recognition_sarrarp50 \
+    --video 41 --max-samples 10
+
+# 전체 (모든 video_* × segmentation frames)
+BACKEND=cosmos-32b DEVICE_VISIBLE=0 \
+  bash grounding_task.sh action_recognition_sarrarp50
+
+# 여러 백엔드 순차 (sequential_2.sh 예)
+BACKEND=qwen2.5 DEVICE_VISIBLE=1 \
+  bash grounding_task.sh action_recognition_sarrarp50 --force
+```
+
+- **`--force` 없음**: JSON에 유효한 `parsed.action_canonical`이 있으면 해당 샘플 VLM 스킵 (resume)
+- **`--force`**: 전 샘플 재추론
+- JSON은 **실행 완료 후** 한 번 저장 (중간 체크포인트 없음)
+- PNG가 일부만 있어도 추출 스크립트는 resume 가능; VLM 스크립트는 **모든 샘플에 PNG 필요**
+
+**PEFT LoRA 예**
+
+```bash
+BACKEND=qwen3-4b DEVICE_VISIBLE=0 \
+  MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full \
+  bash grounding_task.sh action_recognition_sarrarp50 --video 41 --max-samples 5
+```
+
 ### 4.2 Python 직접 실행
 
 **CholecT50**:
@@ -802,6 +923,18 @@ uv run --python ../backend/prismatic-vlms/.venv/bin/python \
   --seq 2 --max-samples 5
 ```
 
+**SAR-RARP50** (추출 후):
+
+```bash
+python scripts/extract_sarrarp50_frames.py --dataset-root ../eval/sarrarp50
+
+uv run --python /path/to/hf-env/bin/python \
+  action_recognition_sarrarp50.py \
+  --backend qwen3-4b \
+  --dataset-root ../eval/sarrarp50 \
+  --prompt-mode mcq
+```
+
 **PEFT LoRA (SurgSigma Qwen3-VL)** — `HF_PYTHON`에 `peft` 설치 필요:
 
 ```bash
@@ -843,6 +976,18 @@ uv run --python /path/to/hf-env/bin/python \
 | `--video 41` | 단일 비디오 (`41`, `video41` 모두 가능) |
 | `--dataset-root` | Cholec80 루트 (기본: `../data/Cholec80`, `cholec80` 폴백) |
 | `--force` / `--output` | triplet과 동일 |
+
+**SAR-RARP50 (`action_recognition_sarrarp50.py`)**
+
+| 인자 | 설명 |
+|------|------|
+| `--dataset-root` | SAR-RARP50 루트 (기본: `../eval/sarrarp50`) |
+| `--video` | 단일 `video_XX` (`41` 또는 `video_41`) |
+| `--prompt-mode {mcq,ov}` | MCQ 8-class vs open vocabulary (기본: `mcq`) |
+| `--max-samples N` | 최대 N 프레임 샘플 |
+| `--frame-reader {auto,ffmpeg,opencv}` | PNG 없을 때 AVI에서 직접 디코드 (기본 eval은 PNG 필수) |
+| `--force` | 기존 JSON 결과 무시하고 VLM 재추론 |
+| `--output` | 결과 JSON 경로 override |
 
 **EndoVis 2017 (`instrument_localization_endovis17.py`)**
 
@@ -905,6 +1050,7 @@ uv run --python /path/to/hf-env/bin/python \
 | EndoVis 2017 | `outputs/instrument_localization_endovis17/loc_{backend}_{model}/` | `endovis2017_instrument_localization.json` |
 | EndoVis 2018 VQA | `outputs/tissue_instrument_recognition_endovis18/tir_{backend}_{model}_mcq_{split}/` | `endovis18_tir_{split}.json` (`split` = `val` / `train` / `both`) |
 | Endoscapes CVS | `outputs/cvs_evaluation_endoscapes/cvs_{backend}_{model}_{protocol}_{split}/` | `endoscapes_cvs_{split}.json` |
+| SAR-RARP50 action | `outputs/action_recognition_sarrarp50/action_{backend}_{model}_{prompt_mode}/` | `sarrarp50_action_seg1hz.json` |
 
 **예시 (`BACKEND=cosmos-32b`, triplet, sequential_gt, mcq, eval-all):**
 
@@ -950,6 +1096,7 @@ JSON 필드 요약:
 - **EndoVis 2017** `results[]`: `label_context` (mask bbox GT), `output.parsed` (bbox); `metrics`: mIoU, mAP@50/75, COCO AP
 - **EndoVis 2018 VQA** `results[]`: `label_context` (question, gold_keyword, options), `output.parsed.keyword`; `metrics`: `accuracy`, `macro_recall`, `macro_precision`, `macro_jaccard` (no `per_class`)
 - **Endoscapes CVS** `metrics`: `average_accuracy`, `balanced_accuracy`, `per_criterion` (C1–C3 accuracy/BA); joint은 `evaluation.per_criterion[]`
+- **SAR-RARP50** `results[]`: `label_context` (GT action), `output.parsed` (`action_canonical` `a0`–`a7`); `metrics`: `accuracy`, `macro_recall`, `macro_precision`, `macro_jaccard`, `per_class`
 
 ---
 
@@ -976,6 +1123,7 @@ JSON 필드 요약:
 | `ENDOVIS18_VQA_ROOT` | tissue/instrument `--vqa-root` (기본: `../eval/EndoVis-18-VQA`) |
 | `ENDOVIS2018_IMAGES_ROOT` | tissue/instrument `--images-root` (기본: `../eval/endovis2018`) |
 | `ENDOSCAPES_ROOT` | CVS `--dataset-root` (기본: `../eval/endoscapes`) |
+| `SARRARP50_ROOT` | action recognition `--dataset-root` (기본: `../eval/sarrarp50`) |
 | `PRISMATIC_PYTHON` | prismatic venv python override |
 | `GROUNDING_TASK_AUTO_BACKEND_SETUP` | `0`이면 prismatic uv 자동 설치 스킵 |
 
@@ -988,6 +1136,7 @@ JSON 필드 요약:
 | 목적 | CholecT50 triplet · Cholec80 phase · EndoVis 2017 bbox · EndoVis 18 VQA MCQ | Localization, language/visual grounding 등 |
 | CholecT50 | `triplet_recognition_cholect50.py` | `localization_cholect50.py`, `language_grounding_v*`, … |
 | Cholec80 | `phase_recognition_cholec80.py` | (별도 phase 스크립트 없음) |
+| SAR-RARP50 | `action_recognition_sarrarp50.py` | segmentation-indexed frames + `action_discrete.txt` |
 | EndoVis 2017 | `instrument_localization_endovis17.py` | mask segmentation (별도) |
 | EndoVis 2018 VQA | `tissue_instrument_recognition_endovis18.py` | — |
 | Bbox | EndoVis 2017 mask→bbox + viz | CholecT50 localization 등 |
@@ -1028,10 +1177,16 @@ JSON 필드 요약:
 14. **EndoVis 18 VQA 이미지 없음** — `eval/endovis2018/val/image/seq_N_frameIDX.bmp` 확인; `--image-split both`로 train fallback; seq 11–16은 bmp 없음
 15. **EndoVis 18 VQA 샘플 0개** — `--vqa-root`, `--images-root`, `--seq` 확인
 16. **EndoVis 18 VQA 호출 수** — val 전체 ~1,396회; API 비용·rate limit 주의 (`--max-samples`, `--seq`로 스모크)
+17. **SAR-RARP50 `No samples found`** — `python scripts/extract_sarrarp50_frames.py` 먼저 실행; `video_XX/frames/*.png` 확인
+18. **SAR-RARP50 `Missing PNGs`** — 추출 미완료 또는 `action_discrete.txt`에 없는 stem; `--overwrite`로 재추출
+19. **SAR-RARP50 JSON 없음 (실행 중)** — JSON은 **전체 루프 종료 후**만 저장; 중단 시 viz/메모리만 있고 JSON 없을 수 있음 → 완료까지 실행 또는 `--force` 재실행
+20. **`ModuleNotFoundError: cholec50_data`** — 모듈명은 `cholect50_data` (`t` 포함); `action_recognition_sarrarp50.py` import 확인
 
 ```bash
 python triplet_recognition_cholect50.py --help
 python phase_recognition_cholec80.py --help
+python action_recognition_sarrarp50.py --help
+python scripts/extract_sarrarp50_frames.py --help
 python instrument_localization_endovis17.py --help
 python tissue_instrument_recognition_endovis18.py --help
 python cvs_evaluation_endoscapes.py --help

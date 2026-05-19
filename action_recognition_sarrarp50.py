@@ -32,7 +32,7 @@ from backend_registry import (
     resolve_output_model_name,
 )
 from backends import build_vlm_user_prompt, load_backend
-from cholec50_data import infer_pil_side
+from cholect50_data import infer_pil_side
 from sarrarp50_data import (
     ACTION_CANONICAL_IDS,
     ACTION_CANONICAL_TO_ID,
