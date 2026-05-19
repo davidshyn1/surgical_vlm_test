@@ -6,9 +6,13 @@ import json
 import random
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
+
+BboxMode = Literal["all_pixels", "filtered_union", "largest_component"]
+DEFAULT_BBOX_MODE: BboxMode = "filtered_union"
+DEFAULT_MIN_COMPONENT_PIXELS = 10
 from PIL import Image
 
 _PKG_ROOT = Path(__file__).resolve().parent
@@ -73,14 +77,96 @@ def bbox_pixels_to_normalized(
     return (xmin / w, ymin / h, xmax / w, ymax / h)
 
 
-def bbox_from_class_mask(
+def _union_find_label_components(binary: np.ndarray) -> list[tuple[int, np.ndarray]]:
+    """
+    4-connected components on a boolean mask.
+    Returns [(pixel_count, boolean_mask), ...] sorted by size descending.
+    """
+    if not binary.any():
+        return []
+    h, w = binary.shape
+    coords = np.argwhere(binary)
+    n = len(coords)
+    index_map = -np.ones((h, w), dtype=np.int32)
+    for i, (y, x) in enumerate(coords):
+        index_map[int(y), int(x)] = i
+
+    parent = list(range(n))
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i, (y, x) in enumerate(coords):
+        y, x = int(y), int(x)
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= ny < h and 0 <= nx < w:
+                j = int(index_map[ny, nx])
+                if j >= 0:
+                    union(i, j)
+
+    roots: dict[int, list[tuple[int, int]]] = {}
+    for i, (y, x) in enumerate(coords):
+        r = find(i)
+        roots.setdefault(r, []).append((int(y), int(x)))
+
+    components: list[tuple[int, np.ndarray]] = []
+    for pixels in roots.values():
+        comp = np.zeros((h, w), dtype=bool)
+        for y, x in pixels:
+            comp[y, x] = True
+        components.append((len(pixels), comp))
+    components.sort(key=lambda t: t[0], reverse=True)
+    return components
+
+
+def _class_binary_filtered(
     mask: np.ndarray,
     class_id: int,
     *,
+    bbox_mode: BboxMode,
+    min_component_pixels: int,
+) -> np.ndarray | None:
+    """Build a denoised boolean mask for one semantic class."""
+    binary = mask == class_id
+    if not binary.any():
+        return None
+
+    if bbox_mode == "all_pixels":
+        return binary
+
+    min_comp = max(1, int(min_component_pixels))
+    components = _union_find_label_components(binary)
+    if not components:
+        return None
+
+    if bbox_mode == "largest_component":
+        return components[0][1]
+
+    # filtered_union: keep components >= min_comp; fallback to largest if all are tiny
+    kept = np.zeros_like(binary, dtype=bool)
+    for size, comp in components:
+        if size >= min_comp:
+            kept |= comp
+    if not kept.any():
+        kept = components[0][1]
+    return kept
+
+
+def bbox_from_binary_mask(
+    binary: np.ndarray,
+    *,
     min_pixels: int = 1,
 ) -> tuple[float, float, float, float] | None:
-    """Tight axis-aligned bbox (inclusive pixel xyxy) for one semantic class."""
-    ys, xs = np.where(mask == class_id)
+    """Tight axis-aligned bbox (inclusive pixel xyxy) for a boolean mask."""
+    ys, xs = np.where(binary)
     if xs.size < min_pixels:
         return None
     xmin = float(xs.min())
@@ -92,6 +178,26 @@ def bbox_from_class_mask(
     return (xmin, ymin, xmax, ymax)
 
 
+def bbox_from_class_mask(
+    mask: np.ndarray,
+    class_id: int,
+    *,
+    min_pixels: int = 1,
+    bbox_mode: BboxMode = DEFAULT_BBOX_MODE,
+    min_component_pixels: int = DEFAULT_MIN_COMPONENT_PIXELS,
+) -> tuple[float, float, float, float] | None:
+    """Tight axis-aligned bbox (inclusive pixel xyxy) for one semantic class."""
+    filtered = _class_binary_filtered(
+        mask,
+        class_id,
+        bbox_mode=bbox_mode,
+        min_component_pixels=min_component_pixels,
+    )
+    if filtered is None:
+        return None
+    return bbox_from_binary_mask(filtered, min_pixels=min_pixels)
+
+
 def extract_instrument_boxes_from_mask(
     mask_path: Path,
     *,
@@ -99,6 +205,8 @@ def extract_instrument_boxes_from_mask(
     class_id_to_display: dict[int, str],
     min_pixels: int = 1,
     active_class_ids: tuple[int, ...] = ACTIVE_CLASS_IDS,
+    bbox_mode: BboxMode = DEFAULT_BBOX_MODE,
+    min_component_pixels: int = DEFAULT_MIN_COMPONENT_PIXELS,
 ) -> list[dict[str, Any]]:
     mask_img = Image.open(mask_path)
     mask = np.asarray(mask_img)
@@ -110,7 +218,15 @@ def extract_instrument_boxes_from_mask(
     for cid in sorted(present):
         if cid not in active_class_ids:
             continue
-        bbox_px = bbox_from_class_mask(mask, cid, min_pixels=min_pixels)
+        filtered = _class_binary_filtered(
+            mask,
+            cid,
+            bbox_mode=bbox_mode,
+            min_component_pixels=min_component_pixels,
+        )
+        if filtered is None:
+            continue
+        bbox_px = bbox_from_binary_mask(filtered, min_pixels=min_pixels)
         if bbox_px is None:
             continue
         slug = class_id_to_slug.get(cid)
@@ -126,6 +242,9 @@ def extract_instrument_boxes_from_mask(
                 "bbox_xyxy_px": [float(v) for v in bbox_px],
                 "bbox_xyxy_norm": [float(v) for v in bbox_norm],
                 "mask_pixel_count": int((mask == cid).sum()),
+                "filtered_mask_pixel_count": int(filtered.sum()),
+                "bbox_mode": bbox_mode,
+                "min_component_pixels": int(min_component_pixels),
             }
         )
     return boxes
@@ -156,6 +275,8 @@ def collect_localization_samples(
     instrument_filter: str | None = None,
     frame_stem_filter: str | None = None,
     min_mask_pixels: int = 1,
+    bbox_mode: BboxMode = DEFAULT_BBOX_MODE,
+    min_component_pixels: int = DEFAULT_MIN_COMPONENT_PIXELS,
 ) -> list[dict[str, Any]]:
     root = dataset_root.resolve()
     class_id_to_slug, class_id_to_display = load_class_mapping(root)
@@ -187,6 +308,8 @@ def collect_localization_samples(
                 class_id_to_slug=class_id_to_slug,
                 class_id_to_display=class_id_to_display,
                 min_pixels=min_mask_pixels,
+                bbox_mode=bbox_mode,
+                min_component_pixels=min_component_pixels,
             )
             for box in boxes:
                 if inst_filter and box["instrument_id"] != inst_filter:
@@ -218,13 +341,20 @@ def export_bbox_annotations(
     out_path: Path,
     *,
     dataset_root: Path,
+    bbox_mode: BboxMode = DEFAULT_BBOX_MODE,
+    min_component_pixels: int = DEFAULT_MIN_COMPONENT_PIXELS,
 ) -> None:
     """Write derived bbox annotations JSON for inspection / reuse."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "dataset": "endovis2017",
         "dataset_root": str(dataset_root.resolve()),
-        "source": "mask-derived tight bbox per instrument class per frame",
+        "bbox_mode": bbox_mode,
+        "min_component_pixels": int(min_component_pixels),
+        "source": (
+            "mask-derived tight bbox per instrument class per frame "
+            f"(bbox_mode={bbox_mode}, min_component_pixels={min_component_pixels})"
+        ),
         "bbox_format": "xyxy pixel inclusive + xyxy normalized [0,1]",
         "count": len(samples),
         "samples": samples,

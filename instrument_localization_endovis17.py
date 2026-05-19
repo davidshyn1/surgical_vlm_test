@@ -32,8 +32,11 @@ from backend_registry import (
 from backends import build_vlm_user_prompt, load_backend
 from cholect50_data import infer_pil_side
 from endovis17_data import (
+    DEFAULT_BBOX_MODE,
     DEFAULT_DATASET_ROOT,
+    DEFAULT_MIN_COMPONENT_PIXELS,
     ENDOVIS2017_IMAGE_SIZE,
+    BboxMode,
     build_instrument_localization_prompt,
     collect_localization_samples,
     export_bbox_annotations,
@@ -411,6 +414,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--frame", type=str, default=None, help="Single frame stem, e.g. seq_1_frame225.")
     p.add_argument("--min-mask-pixels", type=int, default=1, help="Min mask pixels for GT bbox.")
     p.add_argument(
+        "--bbox-mode",
+        choices=("all_pixels", "filtered_union", "largest_component"),
+        default=DEFAULT_BBOX_MODE,
+        help=(
+            "GT bbox from mask: all_pixels (legacy min/max), filtered_union "
+            "(drop tiny CCs, union rest), largest_component (single biggest CC)."
+        ),
+    )
+    p.add_argument(
+        "--min-component-pixels",
+        type=int,
+        default=DEFAULT_MIN_COMPONENT_PIXELS,
+        help="For filtered_union: ignore connected components smaller than this.",
+    )
+    p.add_argument(
         "--export-annotations",
         type=Path,
         default=None,
@@ -467,12 +485,15 @@ def main() -> None:
     dataset_root = args.dataset_root.resolve()
     val_splits = args.val_split or list_val_splits(dataset_root)
 
+    bbox_mode: BboxMode = args.bbox_mode
     samples = collect_localization_samples(
         dataset_root=dataset_root,
         val_splits=val_splits,
         instrument_filter=args.instrument,
         frame_stem_filter=args.frame,
         min_mask_pixels=args.min_mask_pixels,
+        bbox_mode=bbox_mode,
+        min_component_pixels=args.min_component_pixels,
     )
     if not samples:
         raise RuntimeError(
@@ -485,6 +506,8 @@ def main() -> None:
             samples,
             args.export_annotations.resolve(),
             dataset_root=dataset_root,
+            bbox_mode=bbox_mode,
+            min_component_pixels=args.min_component_pixels,
         )
         print(
             f"Exported {len(samples)} mask-derived bbox samples to {args.export_annotations}",
@@ -701,7 +724,12 @@ def main() -> None:
         "dataset": "endovis2017",
         "dataset_root": str(dataset_root),
         "val_splits": sorted({s["val_split"] for s in samples}),
-        "gt_source": "mask label -> tight bbox per instrument class",
+        "gt_source": (
+            f"mask label -> tight bbox per instrument class "
+            f"(bbox_mode={bbox_mode}, min_component_pixels={args.min_component_pixels})"
+        ),
+        "bbox_mode": bbox_mode,
+        "min_component_pixels": int(args.min_component_pixels),
         "native_image_size": [ENDOVIS2017_IMAGE_SIZE, ENDOVIS2017_IMAGE_SIZE],
         "vlm_input_side": pil_side,
         "visualization_image_size": [pil_side, pil_side],
