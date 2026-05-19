@@ -44,7 +44,7 @@ from triplet_recognition_cholect50 import (
     _match_option_token,
     parse_mcq_terms,
 )
-from utils import load_results_for_resume, resolve_device, upsert_result
+from utils import load_results_for_resume, resolve_device, strip_lora_answer_tags, upsert_result
 
 _SCRIPT_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_ROOT = _SCRIPT_ROOT / "outputs" / "tissue_instrument_recognition_endovis18"
@@ -128,7 +128,7 @@ def parse_keyword_response(
     options: list[str],
     option_map: dict[str, str],
 ) -> dict[str, Any]:
-    raw = (text or "").strip()
+    raw = strip_lora_answer_tags(text)
     pred: str | None = None
 
     for line in raw.splitlines():
@@ -161,7 +161,7 @@ def parse_tools_response(
     options: list[str],
     option_map: dict[str, str],
 ) -> dict[str, Any]:
-    raw = (text or "").strip()
+    raw = strip_lora_answer_tags(text)
     keywords: list[str] = []
     seen: set[str] = set()
 

@@ -56,6 +56,38 @@ def normalize_instrument_name(s: str | None) -> str:
     return t
 
 
+_LORA_ANSWER_TAG_BODY_RE = re.compile(
+    r"<answer>\s*(.*?)\s*</answer>",
+    re.IGNORECASE | re.DOTALL,
+)
+_LORA_ANSWER_TAG_OPEN_RE = re.compile(
+    r"<answer>\s*(.*)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def strip_lora_answer_tags(text: str | None) -> str:
+    """
+    Extract text inside ``<answer>...</answer>`` from LoRA fine-tuned model outputs.
+
+    If no answer tags are present, returns the stripped input unchanged.
+    Multiple tagged spans are joined with ``", "``.
+    """
+    if text is None:
+        return ""
+    s = str(text).strip()
+    if not s or "<answer" not in s.lower():
+        return s
+    bodies = [m.strip() for m in _LORA_ANSWER_TAG_BODY_RE.findall(s) if m.strip()]
+    if bodies:
+        return ", ".join(bodies)
+    m = _LORA_ANSWER_TAG_OPEN_RE.search(s)
+    if m:
+        inner = re.sub(r"</answer>\s*$", "", m.group(1), flags=re.IGNORECASE).strip()
+        return inner
+    return s
+
+
 def result_lookup_key(rec: dict) -> tuple[str, str] | None:
     inp = rec.get("input") or {}
     path = inp.get("image_path")

@@ -42,6 +42,7 @@ from cholect50_data import (
     sample_by_instrument,
 )
 from utils import (
+    strip_lora_answer_tags,
     ACTION_OPTIONS_FIXED,
     CHOLECT_ROOT,
     TARGET_OPTIONS_FIXED,
@@ -230,7 +231,7 @@ def parse_component_response(
     """Parse a single instrument, verb, or target from model text."""
     comp = (component or "").strip().lower()
     meta = prompt_meta or {}
-    raw = (text or "").strip()
+    raw = strip_lora_answer_tags(text)
     if not raw:
         return None
 
@@ -305,6 +306,7 @@ def _match_option_token(token: str, option_map: dict[str, str], options: list[st
 
 
 def parse_mcq_terms(text: str, options: list[str]) -> list[str]:
+    text = strip_lora_answer_tags(text)
     norm_map: dict[str, str] = {}
     for o in options:
         k = _canonical(o)

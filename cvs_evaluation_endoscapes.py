@@ -36,7 +36,7 @@ from endoscapes_cvs_data import (
     YES_NO_OPTIONS,
     collect_cvs_samples,
 )
-from utils import load_results_for_resume, resolve_device, upsert_result
+from utils import load_results_for_resume, resolve_device, strip_lora_answer_tags, upsert_result
 
 _SCRIPT_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_ROOT = _SCRIPT_ROOT / "outputs" / "cvs_evaluation_endoscapes"
@@ -120,7 +120,7 @@ def build_criterion_prompt(question: str) -> str:
 
 
 def parse_joint_cvs_response(text: str) -> dict[str, Any]:
-    raw = text or ""
+    raw = strip_lora_answer_tags(text)
     labels: list[str | None] = [None, None, None]
 
     for line in raw.splitlines():

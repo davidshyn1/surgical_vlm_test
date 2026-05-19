@@ -53,6 +53,7 @@ from utils import (
     multilabel_classification_metrics,
     normalize_label_key,
     resolve_device,
+    strip_lora_answer_tags,
 )
 
 _SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -68,11 +69,12 @@ from build_surgical_prompt import build_prompt as build_surgical_prompt_text  # 
 def _split_response_tokens(value: str | list[str]) -> list[str]:
     if isinstance(value, list):
         return [normalize_label_key(t) for t in value if str(t).strip()]
-    if not value or not str(value).strip():
+    text = strip_lora_answer_tags(str(value) if value is not None else "")
+    if not text:
         return []
     return [
         normalize_label_key(t)
-        for t in str(value).split(",")
+        for t in text.split(",")
         if t.strip()
     ]
 

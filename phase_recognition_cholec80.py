@@ -51,7 +51,7 @@ from cholec80_data import (
     video_in_split,
 )
 from cholect50_data import infer_pil_side
-from utils import load_results_for_resume, resolve_device, upsert_result
+from utils import load_results_for_resume, resolve_device, strip_lora_answer_tags, upsert_result
 
 _SCRIPT_ROOT = Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_ROOT.parent
@@ -115,7 +115,7 @@ def _match_phase_token(token: str, option_map: dict[str, str]) -> str | None:
 
 
 def parse_phase_response(text: str, *, option_map: dict[str, str]) -> dict[str, Any]:
-    raw = (text or "").strip()
+    raw = strip_lora_answer_tags(text)
     phase_id: str | None = None
 
     m = re.search(

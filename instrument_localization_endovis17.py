@@ -53,6 +53,7 @@ from utils import (
     load_results_for_resume,
     parse_bbox_from_model_text,
     resolve_device,
+    strip_lora_answer_tags,
     upsert_result,
 )
 
@@ -211,7 +212,7 @@ def parse_localization_response(
     image_width: int,
     image_height: int,
 ) -> dict[str, Any]:
-    raw = (text or "").strip()
+    raw = strip_lora_answer_tags(text)
     if re.search(r"\bnot\s+present\b", raw, re.IGNORECASE):
         return {"not_present": True, "bbox_xyxy_norm": None, "bbox_xyxy_px": None, "raw": raw}
 

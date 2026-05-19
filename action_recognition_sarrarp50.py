@@ -44,7 +44,7 @@ from sarrarp50_data import (
     parse_video_dir_name,
     resolve_sarrarp50_root,
 )
-from utils import load_results_for_resume, resolve_device, upsert_result
+from utils import load_results_for_resume, resolve_device, strip_lora_answer_tags, upsert_result
 
 _SCRIPT_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_ROOT = _SCRIPT_ROOT / "outputs" / "action_recognition_sarrarp50"
@@ -112,7 +112,7 @@ def _match_action_token(token: str, option_map: dict[str, str]) -> str | None:
 
 
 def parse_action_response(text: str, *, option_map: dict[str, str]) -> dict[str, Any]:
-  raw = (text or "").strip()
+  raw = strip_lora_answer_tags(text)
   action_canonical: str | None = None
 
   m = re.search(
