@@ -254,6 +254,134 @@ def _gemini_vision_call(
     ).strip()
 
 
+def _openai_text_call(
+    *,
+    model: str,
+    prompt: str,
+    api_key: str,
+    temperature: float,
+    max_tokens: int,
+    timeout_sec: int,
+) -> str:
+    url = "https://api.openai.com/v1/chat/completions"
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    obj = _http_json_post(
+        url,
+        payload,
+        {"Authorization": f"Bearer {api_key}"},
+        timeout_sec=timeout_sec,
+    )
+    choice0 = (obj.get("choices") or [{}])[0]
+    return ((choice0.get("message") or {}).get("content") or "").strip()
+
+
+def _gemini_text_call(
+    *,
+    model: str,
+    prompt: str,
+    api_key: str,
+    temperature: float,
+    max_tokens: int,
+    timeout_sec: int,
+) -> str:
+    model_path = model if model.startswith("models/") else f"models/{model}"
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/{model_path}"
+        f":generateContent?key={api_key}"
+    )
+    payload: dict[str, Any] = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+        },
+    }
+    obj = _http_json_post(url, payload, {}, timeout_sec=timeout_sec)
+    candidates = obj.get("candidates") or []
+    if not candidates:
+        return ""
+    parts = (((candidates[0].get("content") or {}).get("parts")) or [])
+    return "".join(
+        (p.get("text") or "") for p in parts if isinstance(p, dict)
+    ).strip()
+
+
+def _anthropic_text_call(
+    *,
+    model: str,
+    prompt: str,
+    api_key: str,
+    temperature: float,
+    max_tokens: int,
+    timeout_sec: int,
+) -> str:
+    url = "https://api.anthropic.com/v1/messages"
+    payload: dict[str, Any] = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    obj = _http_json_post(
+        url,
+        payload,
+        {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        timeout_sec=timeout_sec,
+    )
+    parts = obj.get("content") or []
+    texts = [p.get("text", "") for p in parts if isinstance(p, dict) and p.get("type") == "text"]
+    return "".join(texts).strip()
+
+
+def api_text_generate(
+    *,
+    provider: str,
+    model: str,
+    prompt: str,
+    api_key: str,
+    temperature: float = 0.0,
+    max_tokens: int = 512,
+    timeout_sec: int = 120,
+) -> str:
+    """Text-only chat completion (no image)."""
+    if provider == "openai":
+        return _openai_text_call(
+            model=model,
+            prompt=prompt,
+            api_key=api_key,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_sec=timeout_sec,
+        )
+    if provider == "gemini":
+        return _gemini_text_call(
+            model=model,
+            prompt=prompt,
+            api_key=api_key,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_sec=timeout_sec,
+        )
+    if provider == "anthropic":
+        return _anthropic_text_call(
+            model=model,
+            prompt=prompt,
+            api_key=api_key,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_sec=timeout_sec,
+        )
+    raise ValueError(f"Unknown API provider: {provider!r}")
+
+
 def _anthropic_vision_call(
     *,
     model: str,
@@ -480,6 +608,22 @@ class ApiVLMBackend:
             max_tokens=max_tokens,
             timeout_sec=timeout_sec,
             image_cache_key=cache_key,
+        )
+
+    def generate_text(self, prompt: str, **gen_kw: Any) -> str:
+        temperature = float(gen_kw.get("temperature", 0.0))
+        if not gen_kw.get("do_sample", temperature > 0):
+            temperature = 0.0
+        max_tokens = int(gen_kw.get("max_new_tokens", 512))
+        timeout_sec = int(gen_kw.get("request_timeout_sec", self.timeout_sec))
+        return api_text_generate(
+            provider=self.provider,
+            model=self.model,
+            prompt=prompt.strip(),
+            api_key=self.api_key,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_sec=timeout_sec,
         )
 
     def generate_parallel(

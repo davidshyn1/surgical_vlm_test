@@ -36,17 +36,36 @@ _BACKEND_ROOT = _REPO_ROOT / "backend"
 PRISMATIC_VLMS_ROOT = _BACKEND_ROOT / "prismatic-vlms"
 
 
+class SimplePromptBuilder:
+    """Pass-through prompt builder for HF / language-only paths."""
+
+    def __init__(self) -> None:
+        self._parts: list[str] = []
+
+    def add_turn(self, role: str, message: str) -> None:
+        if role == "human":
+            self._parts.append(message)
+
+    def get_prompt(self) -> str:
+        return "\n\n".join(self._parts).strip()
+
+
 class VLMBackend(ABC):
     @abstractmethod
     def generate(self, image: Image.Image, prompt: str, **gen_kw: Any) -> str:
         ...
+
+    def generate_text(self, prompt: str, **gen_kw: Any) -> str:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support language-only generate_text()."
+        )
 
     @abstractmethod
     def to(self, device: str, dtype: torch.dtype | None = None) -> None:
         ...
 
     def get_prompt_builder(self, system_prompt: str | None = None) -> Any:
-        return None
+        return SimplePromptBuilder()
 
 
 class PrismaticBackend(VLMBackend):
@@ -72,6 +91,38 @@ class PrismaticBackend(VLMBackend):
         if do_sample:
             gen_args["temperature"] = temperature
         return self.vlm.generate(image, prompt, **gen_args)
+
+    def generate_text(self, prompt: str, **gen_kw: Any) -> str:
+        from contextlib import nullcontext
+        from prismatic.models.vlms.prismatic import PrismaticVLM
+
+        vlm = self.vlm
+        tokenizer = vlm.llm_backbone.tokenizer
+        input_ids = tokenizer(prompt, truncation=True, return_tensors="pt").input_ids.to(vlm.device)
+        mm = torch.tensor([], dtype=torch.long, device=vlm.device)
+        autocast_dtype = vlm.llm_backbone.half_precision_dtype
+        ctx: Any = (
+            torch.autocast("cuda", dtype=autocast_dtype, enabled=vlm.enable_mixed_precision_training)
+            if torch.cuda.is_available()
+            else nullcontext()
+        )
+        temperature = float(gen_kw.get("temperature", 0.0))
+        do_sample = bool(gen_kw.get("do_sample", temperature > 0))
+        gen_args: dict[str, Any] = {
+            "do_sample": do_sample,
+            "max_new_tokens": int(gen_kw.get("max_new_tokens", 256)),
+            "min_length": int(gen_kw.get("min_length", 1)),
+        }
+        if do_sample:
+            gen_args["temperature"] = temperature
+        with torch.inference_mode(), ctx:
+            generated_ids = super(PrismaticVLM, vlm).generate(
+                input_ids=input_ids,
+                pixel_values=None,
+                multimodal_indices=mm,
+                **gen_args,
+            )
+        return tokenizer.decode(generated_ids[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
 
 
 def _processor_has_chat_template(processor: Any) -> bool:
@@ -195,6 +246,46 @@ def _prepare_hf_vlm_inputs(
     return _move_batch_to_device(inputs, device)
 
 
+def _prepare_hf_text_inputs(
+    processor: Any,
+    model: Any,
+    prompt: str,
+    *,
+    model_type: str = "",
+    model_id: str = "",
+) -> dict[str, Any]:
+    """Text-only inputs for HF VLMs (language grounding, no image)."""
+    device = _hf_model_device(model)
+    text_prompt = prompt.strip()
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": text_prompt}],
+        }
+    ]
+
+    if _processor_has_chat_template(processor) and hasattr(processor, "apply_chat_template"):
+        try:
+            inputs = processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+            return _move_batch_to_device(inputs, device)
+        except (ValueError, TypeError) as err:
+            err_msg = str(err).lower()
+            if "chat template" not in err_msg and "jinja" not in err_msg:
+                raise
+
+    tok = getattr(processor, "tokenizer", processor)
+    if not hasattr(tok, "__call__"):
+        raise RuntimeError("HF processor has no chat template and no tokenizer for text-only input.")
+    inputs = tok(text_prompt, return_tensors="pt", truncation=True)
+    return _move_batch_to_device(inputs, device)
+
+
 def _decode_hf_generation(
     processor: Any,
     inputs: dict[str, Any],
@@ -267,6 +358,29 @@ class HfAutoBackend(VLMBackend):
         gen_ids = self.model.generate(
             **inputs,
             max_new_tokens=gen_kw.get("max_new_tokens", 512),
+            do_sample=do_sample,
+            temperature=temperature if do_sample else None,
+        )
+        return _decode_hf_generation(proc, inputs, gen_ids)
+
+    def generate_text(self, prompt: str, **gen_kw: Any) -> str:
+        proc = self.processor
+        if proc is None:
+            raise RuntimeError("HF backend has no processor/tokenizer.")
+
+        inputs = _prepare_hf_text_inputs(
+            proc,
+            self.model,
+            prompt,
+            model_type=self.model_type,
+            model_id=self.model_id,
+        )
+        temperature = gen_kw.get("temperature", 0.0)
+        do_sample = gen_kw.get("do_sample", temperature > 0)
+
+        gen_ids = self.model.generate(
+            **inputs,
+            max_new_tokens=gen_kw.get("max_new_tokens", 256),
             do_sample=do_sample,
             temperature=temperature if do_sample else None,
         )
@@ -413,6 +527,20 @@ def build_vlm_user_prompt(
         return msg
     pb.add_turn(role="human", message=msg)
     return pb.get_prompt()
+
+
+def generate_language_answer(backend: VLMBackend, prompt: str, **gen_kw: Any) -> str:
+    """
+    Text-only generation for language grounding (no image).
+
+    Uses ``generate_text`` on Prismatic / HF AutoProcessor / cloud API backends.
+    """
+    gen_text = getattr(backend, "generate_text", None)
+    if not callable(gen_text):
+        raise NotImplementedError(
+            f"{type(backend).__name__} does not support language-only generate_text()."
+        )
+    return gen_text(prompt, **gen_kw)
 
 
 def load_backend(

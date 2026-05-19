@@ -1,6 +1,6 @@
 # surgical_vlm_test
 
-CholecT50 **triplet recognition** · Cholec80 **phase recognition** · SAR-RARP50 **action recognition** · EndoVis 2017 **instrument localization** · EndoVis 2018 VQA **tissue/instrument recognition** · Endoscapes **CVS evaluation** 벤치를 위한 독립 패키지입니다.  
+CholecT50 **triplet recognition** · CholecT50 **language grounding** (`surgical_prompts.json`) · Cholec80 **phase recognition** · SAR-RARP50 **action recognition** · EndoVis 2017 **instrument localization** · EndoVis 2018 VQA **tissue/instrument recognition** · Endoscapes **CVS evaluation** 벤치를 위한 독립 패키지입니다.  
 `surgical_vlm_grounding`과 분리되어 있으며, CholecT50/80·EndoVis 18 VQA는 분류·인식(MCQ) 중심이고 EndoVis 2017만 mask→bbox·시각화를 사용합니다.
 
 백엔드 (`backends.py` · `backend_registry.py` · `hf_model_loader.py`):
@@ -10,7 +10,7 @@ CholecT50 **triplet recognition** · Cholec80 **phase recognition** · SAR-RARP5
 | **`prismatic`** | `../backend/prismatic-vlms` + Hub id 또는 로컬 `.pt` + `config.json` | TRI-ML Prismatic 전용 |
 | **`cosmos-*` / `qwen3-*` / `internvl*` / `paligemma*` / `groot`** | Hugging Face Hub → `AutoProcessor` + `model.generate()` | 로컬 GPU **추론(eval)만** |
 | **PEFT LoRA** (`--model-id` = 어댑터 Hub/로컬 경로) | 베이스 VLM + `peft` (`hf_model_loader`) | 예: [surgsigma_qwen3vl_full](https://huggingface.co/khtks/Qwen3-VL/tree/main/surgsigma_qwen3vl_full) |
-| **`openai` / `gpt` / `gemini` / `claude`** | Cloud vision API (`api_backends.py`, JPEG base64) | API 키 필요, GPU 불필요 |
+| **`openai` / `gpt` / `gemini` / `claude`** | Cloud API (`api_backends.py`) — vision(JPEG) 또는 **text-only** | API 키 필요, GPU 불필요; `language_grounding_surgical_prompts`는 text endpoint |
 
 - `cosmos-32b` → `nvidia/Cosmos-Reason2-32B` (Qwen3-VL 계열; `cosmos-reason2` repo venv **불필요**)
 - `qwen3-4b` / `qwen3-32b` → `Qwen/Qwen3-VL-*-Instruct` (풀 weight; LoRA는 `--model-id`로 어댑터 지정)
@@ -33,6 +33,7 @@ CholecT50 **triplet recognition** · Cholec80 **phase recognition** · SAR-RARP5
 | `endovis17_data.py` | mask→bbox 샘플 생성·프롬프트 |
 | `endovis18_vqa_data.py` | EndoVis 18 VQA Classification QA·보기·이미지 매핑 |
 | `cvs_evaluation_endoscapes.py` | Endoscapes CVS (yes/no × 3 criteria) |
+| `language_grounding_surgical_prompts.py` | CholecT50 `surgical_prompts.json` text-only triplet completion (F1 + macro AUROC/mAP) |
 | `endoscapes_cvs_data.py` | Endoscapes COCO `ds` → binary GT·샘플 로드 |
 | `scripts/build_endovis2017_bbox_annotations.py` | derived bbox JSON export |
 | `cholect50_data.py` | challenge-val 라벨·프레임 로딩 · 공용 `infer_pil_side()` |
@@ -43,6 +44,9 @@ CholecT50 **triplet recognition** · Cholec80 **phase recognition** · SAR-RARP5
 | `hf_model_loader.py` | HF Hub `AutoProcessor` 로더 |
 | `api_backends.py` | OpenAI / Gemini / Anthropic vision API |
 | `grounding_task.sh` | 실행 런처 (`uv` + Python) |
+| `sequential_1.sh` | 백엔드별 **phase** 배치 (주석으로 on/off) |
+| `sequential_2.sh` | 백엔드별 **language grounding** 배치 |
+| `sequential_3.sh` | 백엔드별 **localization** 등 혼합 템플릿 |
 | `setup_backend.sh` | **prismatic** `.venv` 설치 (uv) |
 | `scripts/extract_cholec80_frames.sh` | Cholec80 0.1 fps 프레임 추출 → `../eval/cholec80/frames_0p1fps` |
 | `scripts/build_cholec80_eval_phase_annotations.py` | eval frame용 `videoNN-phase.txt` manifest 생성 |
@@ -106,6 +110,41 @@ target: abd-wall/cavity, adhesion, ...
 
 `joint`에서 예측 triplet이 여러 개면, GT triplet이 목록 **안에 포함**되면 정답.  
 `sequential_*`에서는 최종 조합 1개 triplet으로 채점합니다.
+
+### CholecT50 Language grounding (`surgical_prompts.json`)
+
+**이미지 없이** 텍스트만으로 CholecT50 triplet 완성에 답합니다 (`language_grounding_surgical_prompts.py`).
+
+- **데이터**: `../eval/prompts/surgical_prompts.json` (148 rows, `cholect50_triplet_completion`) — `phase` + triplet 2개 스칼라 입력 → 나머지 1개 `response` (유효 라벨 **배열**)
+  - `pvt_to_instrument`: (phase, verb, target) → `instrument`
+  - `pit_to_verb`: (phase, instrument, target) → `verb`
+  - `piv_to_target`: (phase, instrument, verb) → `target`
+- **프롬프트 생성**: `eval/prompts/build_surgical_prompt.py` (JSON에는 `prompt` 필드 없음)
+- **추론**: `generate_language_answer()` → `generate_text()` — **PIL/blank image 없음** (prismatic은 LLM-only forward, HF는 `_prepare_hf_text_inputs`, API는 text endpoint)
+- **답변 파싱**: 쉼표 구분 최대 3 term; vocab 내 term → 해당 라벨 score 1; OOV → synthetic `others`=1 (GT `others`는 항상 0)
+- **지표** (`classification_metrics` in JSON):
+  - sample-averaged multi-label **F1**
+  - **macro AUROC** / **macro mAP** per `output_field` (instrument 6 · verb 9 · target 12 + `others`; AUROC undefined 시 0.5 fallback)
+- **백엔드**: `prismatic`, `hf`, `qwen3-*`, `cosmos-*`, `internvl3.5`, `paligemma2`, `groot`, `openai`/`gpt`, `gemini`, `claude` (`grounding_task.sh`와 동일 registry)
+
+데이터 재생성:
+
+```bash
+cd ../eval/prompts && python3 surgical_prompts && python3 preprocess_surgical_prompts.py
+```
+
+```bash
+# 기본 --dataset-json → $SURGICAL_PROMPTS_JSON (../eval/prompts/surgical_prompts.json)
+BACKEND=qwen3-4b bash grounding_task.sh language_grounding_surgical_prompts --limit 20
+BACKEND=prismatic bash grounding_task.sh language_grounding_surgical_prompts --filter-subtype pit_to_verb
+BACKEND=gpt MODEL_ID=gpt-4o-mini bash grounding_task.sh language_grounding_surgical_prompts --limit 20
+
+# 저장 JSON에서 F1/AUROC/mAP만 재계산 (모델 로드 없음)
+python language_grounding_surgical_prompts.py --metrics-only \
+  outputs/language_grounding_surgical_prompts/lang_qwen3-4b_.../surgical_prompts.json
+```
+
+출력: `outputs/language_grounding_surgical_prompts/lang_<backend>_<model>/surgical_prompts.json`
 
 ### Cholec80 Phase Recognition
 
@@ -292,6 +331,17 @@ action_recognition_sarrarp50.py  (VLM → JSON)
 - 라벨 (기본): `<surgical repo>/eval/cholect50-challenge-val/labels`
 - 프레임: `CHOLECT50_VIDEOS_ROOT`로 지정 (예: `.../CholecT50/videos` 또는 challenge-val 내 `videos`)
 
+**CholecT50 (language grounding, text-only)**
+
+| 경로 | 역할 |
+|------|------|
+| `<surgical repo>/eval/prompts/surgical_prompts.json` | 148 QA rows (`cholect50_triplet_completion`) |
+| `eval/prompts/surgical_prompts` | 생성기 (원본 triplet+phase 조합) |
+| `eval/prompts/preprocess_surgical_prompts.py` | JSON 후처리 |
+| `eval/prompts/build_surgical_prompt.py` | 런타임 NL 프롬프트 (`language_grounding_surgical_prompts.py`에서 import) |
+
+재생성: `cd ../eval/prompts && python3 surgical_prompts && python3 preprocess_surgical_prompts.py`
+
 **Cholec80 (phase)**
 
 - 원본: `<surgical repo>/data/cholec80` — `videos/videoNN.mp4`, `phase_annotations/videoNN-phase.txt` (25 fps)
@@ -342,7 +392,7 @@ action_recognition_sarrarp50.py  (VLM → JSON)
 cp /path/to/.hf_token surgical_vlm_test/.hf_token
 ```
 
-**Cloud API** (`BACKEND=openai|gemini|claude` — `.hf_token` 불필요):
+**Cloud API** (`BACKEND=openai|gemini|claude` — `.hf_token` 불필요; vision 태스크는 JPEG, **language grounding**은 text-only):
 
 | Provider | 키 파일 (기본) | 환경 변수 |
 |----------|----------------|-----------|
@@ -595,6 +645,33 @@ eval/sarrarp50/video_41/
 
 ### 4.1 권장: `grounding_task.sh`
 
+`bash grounding_task.sh <task> [args...]` — `BACKEND`·`MODEL_ID`·`DEVICE_VISIBLE`는 환경 변수로 주입 가능.
+
+| `task` | 스크립트 | 기본 데이터 주입 |
+|--------|----------|------------------|
+| `triplet_recognition_cholect50` | `triplet_recognition_cholect50.py` | `--dataset-root` → `CHOLECT50_CHALLENGE_VAL_ROOT` |
+| `language_grounding_surgical_prompts` | `language_grounding_surgical_prompts.py` | `--dataset-json` → `SURGICAL_PROMPTS_JSON` |
+| `phase_recognition_cholec80` | `phase_recognition_cholec80.py` | `CHOLEC80_ROOT`, `CHOLEC80_FRAMES_ROOT`, `--split eval` |
+| `instrument_localization_endovis17` | `instrument_localization_endovis17.py` | `--dataset-root` → `ENDOVIS2017_ROOT` |
+| `tissue_instrument_recognition_endovis18` | `tissue_instrument_recognition_endovis18.py` | `ENDOVIS18_VQA_ROOT`, `ENDOVIS2018_IMAGES_ROOT` |
+| `cvs_evaluation_endoscapes` | `cvs_evaluation_endoscapes.py` | `--dataset-root` → `ENDOSCAPES_ROOT` |
+| `action_recognition_sarrarp50` | `action_recognition_sarrarp50.py` | `--dataset-root` → `SARRARP50_ROOT` |
+
+#### 배치 실행 (`sequential_*.sh`)
+
+백엔드별로 `grounding_task.sh`를 **순차** 호출하는 래퍼입니다. 각 줄 앞 `#`으로 on/off.
+
+| 스크립트 | 용도 (현재 활성 예) |
+|----------|---------------------|
+| `sequential_1.sh` | `phase_recognition_cholec80` — paligemma2, qwen3-4b, qwen3-32b |
+| `sequential_2.sh` | `language_grounding_surgical_prompts` — cosmos/internvl/paligemma/qwen + SurgSigma LoRA |
+| `sequential_3.sh` | localization·triplet 등 혼합 (대부분 주석 템플릿) |
+
+```bash
+cd surgical_vlm_test
+DEVICE_VISIBLE=1 bash sequential_2.sh   # language grounding, GPU 1
+```
+
 #### CholecT50 triplet
 
 **Joint — 전체 평가** (기본, MCQ):
@@ -698,6 +775,63 @@ BACKEND=claude MODEL_ID=claude-3-5-sonnet-20241022 bash grounding_task.sh \
 ```
 
 > **주의:** `DEVICE_VISIBLE`(GPU index) 철자를 맞출 것 (`DEVISE_VISIBLE` 아님). API 백엔드는 GPU를 쓰지 않지만 `DEVICE_VISIBLE`은 무해합니다.
+
+#### CholecT50 language grounding (`surgical_prompts.json`)
+
+`grounding_task.sh` 기본 주입:
+
+- `--dataset-json` → `$SURGICAL_PROMPTS_JSON` (`../eval/prompts/surgical_prompts.json`)
+
+**로컬 HF / Prismatic** (text-only, GPU):
+
+```bash
+BACKEND=qwen3-4b DEVICE_VISIBLE=0 \
+  bash grounding_task.sh language_grounding_surgical_prompts --limit 20
+
+BACKEND=prismatic DEVICE_VISIBLE=0 \
+  bash grounding_task.sh language_grounding_surgical_prompts \
+    --filter-subtype pvt_to_instrument
+
+BACKEND=cosmos-32b HF_PYTHON=/path/to/python \
+  bash grounding_task.sh language_grounding_surgical_prompts --limit 50
+
+# PEFT LoRA (SurgSigma on Qwen3-VL-4B)
+BACKEND=qwen3-4b DEVICE_VISIBLE=1 \
+  MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full \
+  bash grounding_task.sh language_grounding_surgical_prompts
+
+# 여러 백엔드 순차 (sequential_2.sh)
+DEVICE_VISIBLE=1 bash sequential_2.sh
+```
+
+**Cloud text API** (vision 미사용; `surgical_vlm_test/.openai_api_key` 등):
+
+```bash
+BACKEND=gpt MODEL_ID=gpt-4o-mini \
+  bash grounding_task.sh language_grounding_surgical_prompts --limit 20
+
+BACKEND=gemini MODEL_ID=gemini-2.0-flash \
+  bash grounding_task.sh language_grounding_surgical_prompts --limit 20
+
+BACKEND=claude MODEL_ID=claude-3-5-haiku-20241022 \
+  bash grounding_task.sh language_grounding_surgical_prompts --limit 20
+```
+
+**서브타입별 샘플링** (`--multi-subtypes` + `--per-subtype-limit`):
+
+```bash
+bash grounding_task.sh language_grounding_surgical_prompts \
+  --multi-subtypes pvt_to_instrument,pit_to_verb,piv_to_target --per-subtype-limit 10
+```
+
+**메트릭만 재계산** (VLM 로드 없음):
+
+```bash
+python language_grounding_surgical_prompts.py --metrics-only \
+  outputs/language_grounding_surgical_prompts/lang_qwen3-4b_qwen3-vl-4b/surgical_prompts.json
+```
+
+결과 JSON (기본): `outputs/language_grounding_surgical_prompts/lang_<backend>_<model>/surgical_prompts.json`
 
 #### Cholec80 phase
 
@@ -859,8 +993,12 @@ BACKEND=qwen3-4b DEVICE_VISIBLE=0 \
 BACKEND=cosmos-32b DEVICE_VISIBLE=0 \
   bash grounding_task.sh action_recognition_sarrarp50
 
-# 여러 백엔드 순차 (sequential_2.sh 예)
-BACKEND=qwen2.5 DEVICE_VISIBLE=1 \
+# 여러 백엔드 순차 — `sequential_2.sh` (language grounding) 또는 아래처럼 수동
+BACKEND=qwen3-4b DEVICE_VISIBLE=1 bash grounding_task.sh language_grounding_surgical_prompts
+BACKEND=cosmos-32b DEVICE_VISIBLE=1 bash grounding_task.sh language_grounding_surgical_prompts
+
+# SAR-RARP50 resume 스킵 없이 전부 재추론
+BACKEND=qwen3-4b DEVICE_VISIBLE=0 \
   bash grounding_task.sh action_recognition_sarrarp50 --force
 ```
 
@@ -933,6 +1071,21 @@ uv run --python /path/to/hf-env/bin/python \
   --backend qwen3-4b \
   --dataset-root ../eval/sarrarp50 \
   --prompt-mode mcq
+```
+
+**CholecT50 language grounding** (text-only, GPU 또는 API):
+
+```bash
+uv run --python /path/to/hf-env/bin/python \
+  language_grounding_surgical_prompts.py \
+  --backend qwen3-4b \
+  --dataset-json ../eval/prompts/surgical_prompts.json \
+  --limit 20
+
+# 메트릭만 재계산 (VLM 로드 없음)
+uv run --python /path/to/hf-env/bin/python \
+  language_grounding_surgical_prompts.py --metrics-only \
+  outputs/language_grounding_surgical_prompts/lang_qwen3-4b_qwen3-vl-4b/surgical_prompts.json
 ```
 
 **PEFT LoRA (SurgSigma Qwen3-VL)** — `HF_PYTHON`에 `peft` 설치 필요:
@@ -1014,6 +1167,23 @@ uv run --python /path/to/hf-env/bin/python \
 | `--max-samples N` | 최대 N개 QA쌍만 평가 |
 | `--force` / `--output` | resume·재추론·결과 경로 |
 
+**CholecT50 language grounding (`language_grounding_surgical_prompts.py`)**
+
+| 인자 | 설명 |
+|------|------|
+| `--dataset-json` | `surgical_prompts.json` (기본: `../eval/prompts/surgical_prompts.json`) |
+| `--limit N` | 최대 N개 샘플 (필터 후) |
+| `--filter-category` | JSON `category` 필터 (예: `cholect50_triplet_completion`) |
+| `--filter-subtype` | `pvt_to_instrument` / `pit_to_verb` / `piv_to_target` |
+| `--multi-subtypes` | 쉼표 구분 subtype 목록 (`--per-subtype-limit` 필수) |
+| `--per-subtype-limit` | subtype별 최대 샘플 수 |
+| `--max-pred-labels` | 답변에서 유지할 최대 라벨 수 (기본 3) |
+| `--max-new-tokens` | 생성 토큰 상한 (기본 16) |
+| `--metrics-only PATH` | 기존 결과 JSON에서 F1/AUROC/mAP만 재계산 |
+| `--output` / `--output-root` | 결과 경로 override |
+
+이미지·비디오 입력 없음. 로컬 HF/prismatic은 `generate_text()`; API는 text endpoint.
+
 **Endoscapes CVS (`cvs_evaluation_endoscapes.py`)**
 
 | 인자 | 설명 |
@@ -1051,6 +1221,7 @@ uv run --python /path/to/hf-env/bin/python \
 | EndoVis 2018 VQA | `outputs/tissue_instrument_recognition_endovis18/tir_{backend}_{model}_mcq_{split}/` | `endovis18_tir_{split}.json` (`split` = `val` / `train` / `both`) |
 | Endoscapes CVS | `outputs/cvs_evaluation_endoscapes/cvs_{backend}_{model}_{protocol}_{split}/` | `endoscapes_cvs_{split}.json` |
 | SAR-RARP50 action | `outputs/action_recognition_sarrarp50/action_{backend}_{model}_{prompt_mode}/` | `sarrarp50_action_seg1hz.json` |
+| Language grounding | `outputs/language_grounding_surgical_prompts/lang_{backend}_{model}/` | `surgical_prompts.json` |
 
 **예시 (`BACKEND=cosmos-32b`, triplet, sequential_gt, mcq, eval-all):**
 
@@ -1086,7 +1257,23 @@ outputs/triplet_recognition_cholect50/
 
 (`MODEL_NAME`으로 slug를 덮어쓸 수 있음.)
 
-`--output` / `--output-root`로 경로 override. 동일 JSON으로 재실행 시 **resume**; `--force`로 전부 재추론.
+**예시 (language grounding, full 148 questions):**
+
+```
+outputs/language_grounding_surgical_prompts/
+  lang_qwen3-4b_qwen3-vl-4b/
+    surgical_prompts.json
+  lang_qwen3-4b_surgsigma_qwen3vl_full/
+    surgical_prompts.json
+```
+
+`--output` / `--output-root`로 경로 override. vision 태스크는 동일 JSON **resume** + `--force`; language grounding은 매 실행 전체 재추론( resume 미구현).
+
+JSON 필드 요약 (language grounding):
+
+- `classification_metrics`: `overall_macro_auroc`, `overall_macro_map`, `by_output_field`, `by_subtype`
+- `counts`: `sample_averaged_f1`, `rows_scored`
+- `results[]`: `input` (subtype, gold_labels, prompt), `output.text`, `evaluation` (F1, per-label scores)
 
 JSON 필드 요약:
 
@@ -1124,6 +1311,7 @@ JSON 필드 요약:
 | `ENDOVIS2018_IMAGES_ROOT` | tissue/instrument `--images-root` (기본: `../eval/endovis2018`) |
 | `ENDOSCAPES_ROOT` | CVS `--dataset-root` (기본: `../eval/endoscapes`) |
 | `SARRARP50_ROOT` | action recognition `--dataset-root` (기본: `../eval/sarrarp50`) |
+| `SURGICAL_PROMPTS_JSON` | language grounding `--dataset-json` (기본: `../eval/prompts/surgical_prompts.json`) |
 | `PRISMATIC_PYTHON` | prismatic venv python override |
 | `GROUNDING_TASK_AUTO_BACKEND_SETUP` | `0`이면 prismatic uv 자동 설치 스킵 |
 
@@ -1133,8 +1321,8 @@ JSON 필드 요약:
 
 | | **surgical_vlm_test** | **surgical_vlm_grounding** |
 |---|------------------------|------------------------------|
-| 목적 | CholecT50 triplet · Cholec80 phase · EndoVis 2017 bbox · EndoVis 18 VQA MCQ | Localization, language/visual grounding 등 |
-| CholecT50 | `triplet_recognition_cholect50.py` | `localization_cholect50.py`, `language_grounding_v*`, … |
+| 목적 | CholecT50 triplet·language · Cholec80 phase · EndoVis 2017 bbox · EndoVis 18 VQA MCQ · SAR-RARP50 action | Localization, legacy visual grounding 등 |
+| CholecT50 | `triplet_recognition_cholect50.py`, `language_grounding_surgical_prompts.py` | `localization_cholect50.py`, legacy `language_grounding_v*`, … |
 | Cholec80 | `phase_recognition_cholec80.py` | (별도 phase 스크립트 없음) |
 | SAR-RARP50 | `action_recognition_sarrarp50.py` | segmentation-indexed frames + `action_discrete.txt` |
 | EndoVis 2017 | `instrument_localization_endovis17.py` | mask segmentation (별도) |
@@ -1169,6 +1357,8 @@ JSON 필드 요약:
 6e. **API 비용·속도** — `sequential_gt` + `--eval-all`은 호출 수 많음; 스모크는 `--video` / `--max-samples` 권장  
 7. **resume** — 동일 `--output` JSON에 이어서 실행; 전체 재실행은 `--force`  
 8. **triplet sequential이 느림** — annotation당 VLM 3회; 빠른 테스트는 `--eval-protocol joint` 또는 `--samples-only`  
+9. **`surgical_prompts.json` 없음** — `cd ../eval/prompts && python3 surgical_prompts && python3 preprocess_surgical_prompts.py`  
+10. **language grounding API** — vision 키와 동일; `generate_text` 경로 사용 (`BACKEND=gpt` 등). 로컬 HF는 vision weight 로드 후 텍스트만 forward  
 9. **phase eval이 너무 느림** — 기본 `../eval/cholec80/frames_0p1fps`(0.1 fps, ~9.8k calls); 25 fps는 `--frame-stride 1`  
 10. **프롬프트/프로토콜 변경 후** — 이전 JSON과 혼동 방지를 위해 `--force` 권장  
 11. **EndoVis 2017 데이터 없음** — `eval/endovis2017/val*/image`, `val*/label` 확인  

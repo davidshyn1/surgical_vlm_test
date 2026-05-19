@@ -562,6 +562,214 @@ def draw_gt_pred_comparison_visualization(
     return out
 
 
+def normalize_label_key(term: str) -> str:
+    """Canonical key for matching triplet labels (spaces vs hyphens)."""
+    return re.sub(r"[\s\-_]+", "-", (term or "").strip().lower())
+
+
+OTHERS_LABEL_KEY = "others"
+
+
+def label_classes_with_others(classes: list[str]) -> list[str]:
+    """Vocabulary labels plus synthetic ``others`` (GT always 0)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for cls in classes:
+        key = normalize_label_key(cls)
+        if key not in seen:
+            seen.add(key)
+            out.append(cls)
+    if OTHERS_LABEL_KEY not in seen:
+        out.append("others")
+    return out
+
+
+def build_pred_label_scores(
+    pred_tokens: list[str],
+    classes: list[str],
+) -> tuple[dict[str, float], list[str], list[str]]:
+    """
+    Hard 0/1 scores from parsed answer tokens.
+
+    - In-vocab token in answer → that label = 1
+    - In-vocab label not in answer → 0
+    - Any out-of-vocab token → ``others`` = 1 (GT for others is always 0)
+    """
+    class_keys = [normalize_label_key(c) for c in classes]
+    key_to_display = {normalize_label_key(c): c for c in classes}
+    scores = {k: 0.0 for k in class_keys}
+    in_vocab: list[str] = []
+    oov: list[str] = []
+    vocab_set = set(class_keys)
+
+    for tok in pred_tokens:
+        if tok in vocab_set:
+            scores[tok] = 1.0
+            in_vocab.append(key_to_display.get(tok, tok))
+        else:
+            oov.append(tok)
+
+    scores[OTHERS_LABEL_KEY] = 1.0 if oov else 0.0
+    return scores, in_vocab, oov
+
+
+def build_gold_label_scores(gold_set: set[str], classes: list[str]) -> dict[str, float]:
+    """Gold 0/1 vector; ``others`` is always 0."""
+    class_keys = [normalize_label_key(c) for c in classes]
+    scores = {k: (1.0 if k in gold_set else 0.0) for k in class_keys}
+    scores[OTHERS_LABEL_KEY] = 0.0
+    return scores
+
+
+def roc_auc_binary(
+    y_true: list[int],
+    y_score: list[float],
+    *,
+    undefined_fallback: float = 0.5,
+) -> float:
+    """ROC-AUC via Mann–Whitney U; undefined cases use ``undefined_fallback``."""
+    pos = [s for s, t in zip(y_score, y_true, strict=True) if t == 1]
+    neg = [s for s, t in zip(y_score, y_true, strict=True) if t == 0]
+    if not pos or not neg:
+        return undefined_fallback
+    wins = 0.0
+    for ps in pos:
+        for ns in neg:
+            if ps > ns:
+                wins += 1.0
+            elif ps == ns:
+                wins += 0.5
+    return wins / (len(pos) * len(neg))
+
+
+def average_precision_binary(
+    y_true: list[int],
+    y_score: list[float],
+    *,
+    no_positive_fallback: float = 0.0,
+    all_positive_fallback: float = 1.0,
+) -> float:
+    """Average precision for binary labels (score-sorted)."""
+    if not y_true:
+        return no_positive_fallback
+    n_pos = sum(y_true)
+    if n_pos == 0:
+        return no_positive_fallback
+    if n_pos == len(y_true):
+        return all_positive_fallback
+
+    pairs = sorted(zip(y_score, y_true), key=lambda x: (-x[0], -x[1]))
+    tp = 0
+    fp = 0
+    precisions: list[float] = []
+    for _score, yt in pairs:
+        if yt == 1:
+            tp += 1
+            precisions.append(tp / (tp + fp))
+        else:
+            fp += 1
+    return sum(precisions) / n_pos
+
+
+def _macro_multilabel_classification_metrics(
+    gold_sets: list[set[str]],
+    pred_scores: list[dict[str, float]],
+    classes: list[str],
+    *,
+    include_others: bool = True,
+    undefined_auc_fallback: float = 0.5,
+) -> dict[str, Any]:
+    """Macro AUROC and macro mAP over ``classes`` (+ optional ``others``)."""
+    if not gold_sets:
+        return {
+            "macro_auroc": None,
+            "macro_map": None,
+            "per_label": {},
+            "n_labels_scored": 0,
+            "n_labels_total": 0,
+        }
+
+    eval_classes = label_classes_with_others(classes) if include_others else list(classes)
+    per_label: dict[str, dict[str, float]] = {}
+    aucs: list[float] = []
+    aps: list[float] = []
+
+    for cls in eval_classes:
+        ckey = normalize_label_key(cls)
+        y_true = [1 if ckey in gs else 0 for gs in gold_sets]
+        if ckey == OTHERS_LABEL_KEY:
+            y_true = [0] * len(gold_sets)
+        y_score = [float(ps.get(ckey, 0.0)) for ps in pred_scores]
+
+        auc = roc_auc_binary(y_true, y_score, undefined_fallback=undefined_auc_fallback)
+        ap = average_precision_binary(y_true, y_score)
+        per_label[cls] = {"auroc": auc, "ap": ap}
+        aucs.append(auc)
+        aps.append(ap)
+
+    return {
+        "macro_auroc": sum(aucs) / len(aucs) if aucs else None,
+        "macro_map": sum(aps) / len(aps) if aps else None,
+        "per_label": per_label,
+        "n_labels_scored": len(aucs),
+        "n_labels_total": len(eval_classes),
+        "includes_others_class": include_others,
+    }
+
+
+def mean_auroc_multilabel(
+    gold_sets: list[set[str]],
+    pred_scores: list[dict[str, float]],
+    classes: list[str],
+) -> dict[str, Any]:
+    """Macro-averaged AUROC (always defined via per-label fallback + ``others``)."""
+    block = _macro_multilabel_classification_metrics(
+        gold_sets, pred_scores, classes, include_others=True,
+    )
+    per_label = {
+        cls: metrics.get("auroc")
+        for cls, metrics in block.get("per_label", {}).items()
+    }
+    return {
+        "macro_auroc": block.get("macro_auroc"),
+        "per_label": per_label,
+        "n_labels_scored": block.get("n_labels_scored"),
+        "n_labels_total": block.get("n_labels_total"),
+    }
+
+
+def mean_map_multilabel(
+    gold_sets: list[set[str]],
+    pred_scores: list[dict[str, float]],
+    classes: list[str],
+) -> dict[str, Any]:
+    """Macro-averaged mAP (``others`` GT always 0)."""
+    block = _macro_multilabel_classification_metrics(
+        gold_sets, pred_scores, classes, include_others=True,
+    )
+    per_label = {
+        cls: metrics.get("ap")
+        for cls, metrics in block.get("per_label", {}).items()
+    }
+    return {
+        "macro_map": block.get("macro_map"),
+        "per_label": per_label,
+        "n_labels_scored": block.get("n_labels_scored"),
+        "n_labels_total": block.get("n_labels_total"),
+    }
+
+
+def multilabel_classification_metrics(
+    gold_sets: list[set[str]],
+    pred_scores: list[dict[str, float]],
+    classes: list[str],
+) -> dict[str, Any]:
+    """Combined macro AUROC + macro mAP block."""
+    return _macro_multilabel_classification_metrics(
+        gold_sets, pred_scores, classes, include_others=True,
+    )
+
+
 def draw_single_bbox_visualization(
     rgb: Image.Image,
     bbox: tuple[float, float, float, float],

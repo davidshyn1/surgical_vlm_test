@@ -27,6 +27,7 @@ export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_CACHE_ROOT/transformers}"
 : "${ENDOVIS2018_IMAGES_ROOT:=$ROOT/../eval/endovis2018}"
 : "${ENDOSCAPES_ROOT:=$ROOT/../eval/endoscapes}"
 : "${SARRARP50_ROOT:=$ROOT/../eval/sarrarp50}"
+: "${SURGICAL_PROMPTS_JSON:=$ROOT/../eval/prompts/surgical_prompts.json}"
 
 guess_conda_python() {
   local env_name="$1"
@@ -147,6 +148,10 @@ Usage:
   BACKEND=<backend> bash grounding_task.sh instrument_localization_endovis17 [args...]
   BACKEND=<backend> bash grounding_task.sh tissue_instrument_recognition_endovis18 [args...]
   BACKEND=<backend> bash grounding_task.sh cvs_evaluation_endoscapes [args...]
+  BACKEND=<backend> bash grounding_task.sh language_grounding_surgical_prompts [args...]
+
+Language grounding uses text-only inference (no image). Compatible backends:
+  prismatic, hf, qwen3-*, cosmos-*, internvl3.5, paligemma2, groot, openai, gemini, claude
 
 Backends:
   prismatic     TRI-ML prismatic-vlms (local backend package / checkpoint)
@@ -168,6 +173,10 @@ Examples:
   BACKEND=cosmos-32b HF_PYTHON=/path/to/python \\
     bash grounding_task.sh phase_recognition_cholec80 --video 41
 
+  BACKEND=prismatic bash grounding_task.sh language_grounding_surgical_prompts --limit 20
+  BACKEND=qwen3-4b bash grounding_task.sh language_grounding_surgical_prompts --filter-subtype pit_to_verb
+  BACKEND=gpt MODEL_ID=gpt-4o-mini bash grounding_task.sh language_grounding_surgical_prompts --limit 20
+
 Env:
   HF_PYTHON                     Python for local HF backends (default: conda surgical)
   API_PYTHON                    Python for openai/gemini/claude (default: same as HF_PYTHON)
@@ -175,6 +184,7 @@ Env:
   MODEL_ID                      default --model-id when omitted
   MODEL_NAME                    default --model-name (output folder slug) when omitted
   GROUNDING_TASK_AUTO_BACKEND_SETUP=0  skip auto uv install (prismatic only)
+  SURGICAL_PROMPTS_JSON              default --dataset-json for language_grounding_surgical_prompts
 EOF
 }
 
@@ -193,6 +203,7 @@ case "$task" in
   tissue_instrument_recognition_endovis18) script="tissue_instrument_recognition_endovis18.py" ;;
   cvs_evaluation_endoscapes) script="cvs_evaluation_endoscapes.py" ;;
   action_recognition_sarrarp50) script="action_recognition_sarrarp50.py" ;;
+  language_grounding_surgical_prompts) script="language_grounding_surgical_prompts.py" ;;
   -h|--help|help) usage; exit 0 ;;
   *)
     echo "ERROR: unknown task '$task'" >&2
@@ -256,6 +267,10 @@ fi
 
 if [[ "$task" == "action_recognition_sarrarp50" ]]; then
   ! has_flag "--dataset-root" "$@" && set -- "$@" --dataset-root "$SARRARP50_ROOT"
+fi
+
+if [[ "$task" == "language_grounding_surgical_prompts" ]]; then
+  ! has_flag "--dataset-json" "$@" && set -- "$@" --dataset-json "$SURGICAL_PROMPTS_JSON"
 fi
 
 exec uv run --python "$python_bin" "$script" "$@"
