@@ -119,8 +119,20 @@ target: abd-wall/cavity, adhesion, ...
   - `pvt_to_instrument`: (phase, verb, target) → `instrument`
   - `pit_to_verb`: (phase, instrument, target) → `verb`
   - `piv_to_target`: (phase, instrument, verb) → `target`
-- **프롬프트 생성**: `eval/prompts/build_surgical_prompt.py` (JSON에는 `prompt` 필드 없음)
+- **프롬프트 생성**: `eval/prompts/build_surgical_prompt.py` — 질문 + **예측 필드 MCQ 옵션 목록** + 답변 형식 지시 (런타임; JSON에 `prompt` 필드 없음)
+- **옵션 vocab**: `eval/prompts/cholect50_label_options.py` (instrument 6 · verb 9 · target 12); eval 시 `surgical_prompts.json` union으로 덮어씀
 - **추론**: `generate_language_answer()` → `generate_text()` — **PIL/blank image 없음** (prismatic은 LLM-only forward, HF는 `_prepare_hf_text_inputs`, API는 text endpoint)
+
+**프롬프트 예 (`pvt_to_instrument`)**
+
+```
+During the 'preparation' phase of laparoscopic cholecystectomy,
+which surgical instrument(s) are used to grasp the gallbladder?
+
+The available instrument options are: bipolar, clipper, grasper, hook, irrigator, scissors.
+Answer with one or more instrument(s) from the options above only,
+as a comma-separated list (at most 3 labels). Do not add explanation.
+```
 - **답변 파싱**: 쉼표 구분 최대 3 term; vocab 내 term → 해당 라벨 score 1; OOV → synthetic `others`=1 (GT `others`는 항상 0)
 - **지표** (`classification_metrics` in JSON):
   - sample-averaged multi-label **F1**

@@ -158,6 +158,7 @@ def load_surgical_prompt_rows(
     *,
     filter_category: str | None,
     filter_subtype: str | None,
+    label_options: dict[str, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
     if not isinstance(raw, list):
         raise ValueError(f"{source_label}: expected a JSON array at root")
@@ -173,7 +174,7 @@ def load_surgical_prompt_rows(
         if isinstance(response, str) and not response.strip():
             continue
         try:
-            prompt = build_surgical_prompt_text(obj)
+            prompt = build_surgical_prompt_text(obj, label_options=label_options)
         except (ValueError, KeyError):
             continue
         cat = obj.get("category")
@@ -209,6 +210,7 @@ def load_rows_multi_subtypes(
     filter_category: str | None,
     subtypes: list[str],
     per_subtype_limit: int,
+    label_options: dict[str, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
     if per_subtype_limit < 0:
         raise ValueError("per_subtype_limit must be >= 0")
@@ -218,7 +220,11 @@ def load_rows_multi_subtypes(
         if not st:
             continue
         part = load_surgical_prompt_rows(
-            raw, source_label, filter_category=filter_category, filter_subtype=st
+            raw,
+            source_label,
+            filter_category=filter_category,
+            filter_subtype=st,
+            label_options=label_options,
         )
         out.extend(part[:per_subtype_limit])
     return out
@@ -490,6 +496,7 @@ def main() -> None:
             filter_category=args.filter_category,
             subtypes=multi_list,
             per_subtype_limit=max(0, args.per_subtype_limit),
+            label_options=label_vocab,
         )
     else:
         rows = load_surgical_prompt_rows(
@@ -497,6 +504,7 @@ def main() -> None:
             str(json_path),
             filter_category=args.filter_category,
             filter_subtype=args.filter_subtype,
+            label_options=label_vocab,
         )
         if args.limit is not None:
             rows = rows[: max(0, args.limit)]

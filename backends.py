@@ -93,13 +93,13 @@ class PrismaticBackend(VLMBackend):
         return self.vlm.generate(image, prompt, **gen_args)
 
     def generate_text(self, prompt: str, **gen_kw: Any) -> str:
+        """Language-only generation via the underlying causal LM (no vision forward)."""
         from contextlib import nullcontext
-        from prismatic.models.vlms.prismatic import PrismaticVLM
 
         vlm = self.vlm
+        llm = vlm.llm_backbone.llm
         tokenizer = vlm.llm_backbone.tokenizer
         input_ids = tokenizer(prompt, truncation=True, return_tensors="pt").input_ids.to(vlm.device)
-        mm = torch.tensor([], dtype=torch.long, device=vlm.device)
         autocast_dtype = vlm.llm_backbone.half_precision_dtype
         ctx: Any = (
             torch.autocast("cuda", dtype=autocast_dtype, enabled=vlm.enable_mixed_precision_training)
@@ -115,13 +115,10 @@ class PrismaticBackend(VLMBackend):
         }
         if do_sample:
             gen_args["temperature"] = temperature
+        # PrismaticVLM.forward() rejects pixel_values=None unless decoding with cache
+        # (single token + past_key_values). Route text-only calls through the HF LLM directly.
         with torch.inference_mode(), ctx:
-            generated_ids = super(PrismaticVLM, vlm).generate(
-                input_ids=input_ids,
-                pixel_values=None,
-                multimodal_indices=mm,
-                **gen_args,
-            )
+            generated_ids = llm.generate(input_ids=input_ids, **gen_args)
         return tokenizer.decode(generated_ids[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
 
 
