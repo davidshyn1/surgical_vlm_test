@@ -6,10 +6,11 @@
 # BACKEND=qwen3-4b DEVICE_VISIBLE=2 MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full   bash grounding_task.sh cvs_evaluation_endoscapes
 
 
-BACKEND=cosmos-32b DEVICE_VISIBLE=2 bash grounding_task.sh  cvs_evaluation_endoscapes --force
-BACKEND=internvl3.5 DEVICE_VISIBLE=2 bash grounding_task.sh  cvs_evaluation_endoscapes --force
-BACKEND=paligemma2 DEVICE_VISIBLE=2 bash grounding_task.sh  cvs_evaluation_endoscapes --force
-BACKEND=qwen2.5 DEVICE_VISIBLE=2 bash grounding_task.sh  cvs_evaluation_endoscapes --force
-BACKEND=qwen3-4b DEVICE_VISIBLE=2 bash grounding_task.sh  cvs_evaluation_endoscapes --force
-BACKEND=qwen3-32b DEVICE_VISIBLE=2 bash grounding_task.sh  cvs_evaluation_endoscapes --force
-BACKEND=cosmos-2b DEVICE_VISIBLE=2 bash grounding_task.sh  cvs_evaluation_endoscapes --force
+BACKEND=cosmos-32b DEVICE_VISIBLE=2 bash grounding_task.sh   triplet_recognition_cholect50 --prompt-mode mcq --eval-all --eval-protocol joint --max-new-tokens 32
+BACKEND=internvl3.5 DEVICE_VISIBLE=2 bash grounding_task.sh   triplet_recognition_cholect50 --prompt-mode mcq --eval-all --eval-protocol joint --max-new-tokens 32
+BACKEND=paligemma2 DEVICE_VISIBLE=2 bash grounding_task.sh   triplet_recognition_cholect50 --prompt-mode mcq --eval-all --eval-protocol joint --max-new-tokens 32
+BACKEND=qwen2.5 DEVICE_VISIBLE=2 bash grounding_task.sh   triplet_recognition_cholect50 --prompt-mode mcq --eval-all --eval-protocol joint --max-new-tokens 32 
+BACKEND=qwen3-4b DEVICE_VISIBLE=2 bash grounding_task.sh   triplet_recognition_cholect50 --prompt-mode mcq --eval-all --eval-protocol joint --max-new-tokens 32 
+BACKEND=qwen3-32b DEVICE_VISIBLE=2 bash grounding_task.sh   triplet_recognition_cholect50 --prompt-mode mcq --eval-all --eval-protocol joint --max-new-tokens 32 
+BACKEND=cosmos-2b DEVICE_VISIBLE=2 bash grounding_task.sh   triplet_recognition_cholect50 --prompt-mode mcq --eval-all --eval-protocol joint --max-new-tokens 32 
+BACKEND=qwen3-4b DEVICE_VISIBLE=2 MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full   bash grounding_task.sh triplet_recognition_cholect50 --prompt-mode mcq --eval-all --eval-protocol joint --max-new-tokens 32

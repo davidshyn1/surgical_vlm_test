@@ -598,6 +598,13 @@ def load_hf_vlm(
 
     Returns (model, processor, meta).
     """
+    if looks_like_prismatic_model_id(model_id):
+        raise ValueError(
+            f"Model id {model_id!r} is a TRI-ML Prismatic checkpoint. "
+            "Use backends.load_backend(backend='prismatic') or "
+            "BACKEND=prismatic bash grounding_task.sh <task> (not qwen3/hf AutoProcessor)."
+        )
+
     cache = _hub_cache_dir(cache_dir)
     token = hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
     dtype = _dtype_for_device(device)
@@ -672,3 +679,16 @@ def load_hf_vlm(
 
 def is_prismatic_hub_id(model_id: str) -> bool:
     return model_id.startswith(f"{PRISMATIC_VLMS_REPO}/")
+
+
+def looks_like_prismatic_model_id(model_id: str) -> bool:
+    """True for TRI-ML Prismatic ids (must use ``backend='prismatic'``, not HF AutoProcessor)."""
+    mid = (model_id or "").strip()
+    if not mid:
+        return False
+    if is_prismatic_hub_id(mid):
+        return True
+    # Registry ids, e.g. prism-dinosiglip+7b
+    if mid.startswith("prism-") and "+" in mid:
+        return True
+    return mid in PRISMATIC_VLMS_SUBDIRS

@@ -219,6 +219,7 @@ ensure_repo_uv_venv_if_needed "$backend"
 python_bin="$(resolve_backend_python "$backend")"
 append_unique_pythonpath "$ROOT"
 repo="$(backend_repo_dir "$backend")"
+# prismatic: add prismatic-vlms so ``import prismatic`` works (backends.py also sets this).
 [[ -n "$repo" ]] && append_unique_pythonpath "$repo"
 
 set -- "$@" --backend "$backend"

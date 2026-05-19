@@ -31,7 +31,8 @@ from hf_model_loader import load_hf_vlm
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _BACKEND_ROOT = _REPO_ROOT / "backend"
-_PRISMATIC_PKG = _BACKEND_ROOT / "prismatic" / "prismatic"
+# TRI-ML package root: ``import prismatic`` resolves from ``prismatic-vlms/``.
+PRISMATIC_VLMS_ROOT = _BACKEND_ROOT / "prismatic-vlms"
 
 
 class VLMBackend(ABC):
@@ -52,24 +53,24 @@ class PrismaticBackend(VLMBackend):
         self.vlm = vlm
         self.image_size = image_size
 
-    def to(self, device: str, dtype: torch.dtype | None = None) -> None:
-        self.vlm.to(device, dtype=dtype)
+    def to(self, device: str | torch.device, dtype: torch.dtype | None = None) -> None:
+        dev = device if isinstance(device, torch.device) else torch.device(device)
+        self.vlm.to(dev, dtype=dtype)
 
     def get_prompt_builder(self, system_prompt: str | None = None) -> Any:
-        from prismatic.models.backbones.llm.prompting import PurePromptBuilder
-
-        return PurePromptBuilder("prism-dinosiglip+7b", model_family="prism")
+        return self.vlm.get_prompt_builder(system_prompt=system_prompt)
 
     def generate(self, image: Image.Image, prompt: str, **gen_kw: Any) -> str:
-        from prismatic import load as prismatic_load
-
-        return prismatic_load.generate(
-            self.vlm,
-            image,
-            prompt,
-            temperature=gen_kw.get("temperature", 0.2),
-            max_new_tokens=gen_kw.get("max_new_tokens", 512),
-        )
+        temperature = float(gen_kw.get("temperature", 0.2))
+        do_sample = bool(gen_kw.get("do_sample", temperature > 0))
+        gen_args: dict[str, Any] = {
+            "do_sample": do_sample,
+            "max_new_tokens": int(gen_kw.get("max_new_tokens", 512)),
+            "min_length": int(gen_kw.get("min_length", 1)),
+        }
+        if do_sample:
+            gen_args["temperature"] = temperature
+        return self.vlm.generate(image, prompt, **gen_args)
 
 
 def _processor_has_chat_template(processor: Any) -> bool:
@@ -271,9 +272,57 @@ class HfAutoBackend(VLMBackend):
         return _decode_hf_generation(proc, inputs, gen_ids)
 
 
-def _ensure_prismatic_on_path() -> None:
-    if str(_PRISMATIC_PKG) not in sys.path:
-        sys.path.insert(0, str(_PRISMATIC_PKG.parent.parent))
+def prismatic_repo_root() -> Path:
+    """Return ``backend/prismatic-vlms`` (must exist for ``backend=prismatic``)."""
+    root = PRISMATIC_VLMS_ROOT.resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(
+            f"Prismatic repo not found at {root}. "
+            "Clone/install TRI-ML prismatic-vlms under surgical/backend/."
+        )
+    return root
+
+
+def _ensure_prismatic_on_path() -> Path:
+    """Add ``prismatic-vlms`` to ``sys.path`` so ``import prismatic`` works."""
+    repo = prismatic_repo_root()
+    repo_str = str(repo)
+    if repo_str not in sys.path:
+        sys.path.insert(0, repo_str)
+    return repo
+
+
+def _resolve_prismatic_run_dir(
+    vlm_checkpoint: Path | None,
+    vlm_config: Path | None,
+) -> Path | None:
+    """
+    Map ``--vlm-config`` / ``--vlm-checkpoint`` to a Prismatic run directory.
+
+    Expected layout: ``<run>/config.json`` and ``<run>/checkpoints/latest-checkpoint.pt``.
+    """
+    if vlm_config is not None and vlm_config.is_file():
+        return vlm_config.resolve().parent
+    if vlm_checkpoint is None:
+        return None
+    ckpt = vlm_checkpoint.resolve()
+    if not ckpt.is_file():
+        raise FileNotFoundError(f"Prismatic checkpoint not found: {ckpt}")
+    parent = ckpt.parent
+    if parent.name == "checkpoints" and (parent.parent / "config.json").is_file():
+        return parent.parent
+    if (parent / "config.json").is_file():
+        return parent
+    raise FileNotFoundError(
+        f"Cannot infer Prismatic run dir from checkpoint {ckpt}. "
+        "Pass --vlm-config pointing at config.json or use a run folder layout."
+    )
+
+
+def _as_torch_device(device: str | torch.device) -> torch.device:
+    if isinstance(device, torch.device):
+        return device
+    return torch.device(device)
 
 
 def _load_prismatic(
@@ -281,33 +330,50 @@ def _load_prismatic(
     hf_token: str | None,
     vlm_checkpoint: Path | None,
     vlm_config: Path | None,
-    device: str,
+    device: str | torch.device,
 ) -> tuple[VLMBackend, dict[str, Any]]:
     _ensure_prismatic_on_path()
     from prismatic import load as prismatic_load
 
-    if vlm_checkpoint is not None and vlm_config is not None:
-        vlm = prismatic_load.load_vlm(
-            str(vlm_checkpoint),
-            hf_token=hf_token,
-            device=device,
-            config_path=str(vlm_config),
-        )
+    cache_dir = os.environ.get("HF_HUB_CACHE") or os.environ.get("HUGGINGFACE_HUB_CACHE")
+    run_dir = _resolve_prismatic_run_dir(vlm_checkpoint, vlm_config)
+
+    if run_dir is not None:
+        vlm = prismatic_load.load(run_dir, hf_token=hf_token, cache_dir=cache_dir)
         meta = {
             "source": "prismatic_checkpoint",
-            "checkpoint": str(vlm_checkpoint),
-            "config": str(vlm_config),
+            "run_dir": str(run_dir),
+            "checkpoint": str(vlm_checkpoint) if vlm_checkpoint else None,
+            "config": str(vlm_config) if vlm_config else str(run_dir / "config.json"),
             "model_id": model_id,
             "bbox_coord_space": "normalized_01",
         }
     else:
-        vlm = prismatic_load.load(model_id, hf_token=hf_token, device=device)
+        vlm = prismatic_load.load(model_id, hf_token=hf_token, cache_dir=cache_dir)
         meta = {
             "source": "prismatic_hub",
             "model_id": model_id,
             "bbox_coord_space": "normalized_01",
         }
-    return PrismaticBackend(vlm, image_size=384), meta
+
+    dev = _as_torch_device(device)
+    dtype = torch.bfloat16 if dev.type == "cuda" and torch.cuda.is_available() else torch.float32
+    vlm.to(dev, dtype=dtype)
+
+    image_side = 384
+    try:
+        cfg_path = run_dir / "config.json" if run_dir else None
+        if cfg_path is None and meta.get("source") == "prismatic_hub":
+            pass
+        if cfg_path and cfg_path.is_file():
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            backbone = str((cfg.get("model") or {}).get("vision_backbone_id", ""))
+            if "224" in backbone:
+                image_side = 224
+    except Exception:
+        pass
+
+    return PrismaticBackend(vlm, image_size=image_side), meta
 
 
 def _load_hf(
