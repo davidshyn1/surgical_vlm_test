@@ -1,6 +1,6 @@
 # surgical_vlm_test
 
-CholecT50 **triplet recognition** · CholecT50 **language grounding** (`surgical_prompts.json`) · Cholec80 **phase recognition** · SAR-RARP50 **action recognition** · EndoVis 2017 **instrument localization** · EndoVis 2018 VQA **tissue/instrument recognition** · Endoscapes **CVS evaluation** 벤치를 위한 독립 패키지입니다.  
+CholecT50 **triplet recognition** · CholecT50 **language grounding** (`surgical_prompts.json`) · CholecT50 **visual cross-attention** · Cholec80 **phase recognition** · SAR-RARP50 **action recognition** · EndoVis 2017 **instrument localization** · EndoVis 2018 VQA **tissue/instrument recognition** · Endoscapes **CVS evaluation** 벤치를 위한 독립 패키지입니다.  
 `surgical_vlm_grounding`과 분리되어 있으며, CholecT50/80·EndoVis 18 VQA는 분류·인식(MCQ) 중심이고 EndoVis 2017만 mask→bbox·시각화를 사용합니다.
 
 백엔드 (`backends.py` · `backend_registry.py` · `hf_model_loader.py`):
@@ -34,6 +34,9 @@ CholecT50 **triplet recognition** · CholecT50 **language grounding** (`surgical
 | `endovis18_vqa_data.py` | EndoVis 18 VQA Classification QA·보기·이미지 매핑 |
 | `cvs_evaluation_endoscapes.py` | Endoscapes CVS (yes/no × 3 criteria) |
 | `language_grounding_surgical_prompts.py` | CholecT50 `surgical_prompts.json` text-only triplet completion (F1 + macro AUROC/mAP) |
+| `visual_cross_attention_cholect50.py` | CholecT50 query×test patch cross-attention heatmap·시각화 |
+| `patch_feature_extractors.py` | timm / prismatic / HF vision tower patch feature 추출 |
+| `cholect_query_match.py` | query 라벨 ↔ 프레임 GT instrument fuzzy match |
 | `endoscapes_cvs_data.py` | Endoscapes COCO `ds` → binary GT·샘플 로드 |
 | `scripts/build_endovis2017_bbox_annotations.py` | derived bbox JSON export |
 | `cholect50_data.py` | challenge-val 라벨·프레임 로딩 · 공용 `infer_pil_side()` |
@@ -332,16 +335,69 @@ action_recognition_sarrarp50.py  (VLM → JSON)
 
 실행 예시는 **§3.9** · **§4.1 SAR-RARP50**을 참고하세요.
 
+### CholecT50 Visual Cross-Attention
+
+**Query × test frame cross-attention** — CholecT50 challenge-val 프레임에서 instrument query 이미지와 test 프레임 patch feature 간 attention map을 계산·시각화합니다. VLM 추론(generate) 없이 **vision tower patch feature**만 사용합니다.
+
+- **Query 이미지**: `assets/cholect50_query/` (`grasper.png`, `clipper.png`, …) 또는 `--query-from-gt-crop` (GT bbox crop)
+- **Feature backbone** (`--feature-backbone`):
+  - `timm` (기본): 공유 DINOv2 + SigLIP (VLM 무관)
+  - `prismatic`: Prismatic VLM `vision_backbone` (dino + concat)
+  - `hf`: `--backend` / `--model-id` VLM의 vision tower (Qwen3-VL, PEFT LoRA 등)
+- **Query encoding** (`--query-encoding`, 기본 `vision_ref`): query·test 모두 `--feature-backbone` patch space (localization 권장). `pixel_grid`는 RGB patch token baseline.
+- **Attention methods** (source별): `cls_softmax`, `mean_cosine`, `patch_cross_mean`, `patch_cross_max` — comparison figure는 `patch_cross_max`만
+- **출력**: `outputs/visual_cross_attention_cholect50/{model_name}/cross_attention.json` + `viz/*_comparison.png`
+
+**빠른 실행 (단일 프레임, GT crop query)**
+
+```bash
+export CHOLECT50_VIDEOS_ROOT=/path/to/CholecT50/videos   # 또는 challenge-val/videos
+
+# HF VLM vision tower (Qwen3-VL 4B)
+BACKEND=qwen3-4b DEVICE_VISIBLE=0 \
+  bash grounding_task.sh visual_cross_attention_cholect50 \
+    --feature-backbone hf --video VID75 --frame 525 --query-from-gt-crop
+
+# SurgSigma LoRA
+BACKEND=qwen3-4b DEVICE_VISIBLE=0 \
+  MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full \
+  bash grounding_task.sh visual_cross_attention_cholect50 \
+    --feature-backbone hf --video VID75 --frame 525 --query-from-gt-crop
+
+# Qwen3-VL 32B
+BACKEND=qwen3-32b DEVICE_VISIBLE=0 \
+  bash grounding_task.sh visual_cross_attention_cholect50 \
+    --feature-backbone hf --video VID75 --frame 525 --query-from-gt-crop
+```
+
+**배치** (instrument당 3 frame, 기본):
+
+```bash
+BACKEND=qwen3-4b DEVICE_VISIBLE=0 \
+  bash grounding_task.sh visual_cross_attention_cholect50 \
+    --feature-backbone hf --query-from-gt-crop --samples-per-instrument 3
+```
+
+**timm DINO+SigLIP** (VLM vision tower 불필요):
+
+```bash
+bash grounding_task.sh visual_cross_attention_cholect50 \
+  --video VID68 --frame 837 --query-from-gt-crop
+```
+
+실행 예시 전체는 **§4.1 CholecT50 visual cross-attention**을 참고하세요.
+
 ---
 
 ## 3. 사전 준비
 
 ### 3.1 데이터
 
-**CholecT50 (triplet)**
+**CholecT50 (triplet · visual cross-attention)**
 
 - 라벨 (기본): `<surgical repo>/eval/cholect50-challenge-val/labels`
 - 프레임: `CHOLECT50_VIDEOS_ROOT`로 지정 (예: `.../CholecT50/videos` 또는 challenge-val 내 `videos`)
+- **Query 이미지** (cross-attention, 선택): `surgical_vlm_test/assets/cholect50_query/` — instrument별 PNG (`grasper.png`, `clipper.png`, …). 없으면 `--query-from-gt-crop` 사용
 
 **CholecT50 (language grounding, text-only)**
 
@@ -668,6 +724,7 @@ eval/sarrarp50/video_41/
 | `tissue_instrument_recognition_endovis18` | `tissue_instrument_recognition_endovis18.py` | `ENDOVIS18_VQA_ROOT`, `ENDOVIS2018_IMAGES_ROOT` |
 | `cvs_evaluation_endoscapes` | `cvs_evaluation_endoscapes.py` | `--dataset-root` → `ENDOSCAPES_ROOT` |
 | `action_recognition_sarrarp50` | `action_recognition_sarrarp50.py` | `--dataset-root` → `SARRARP50_ROOT` |
+| `visual_cross_attention_cholect50` | `visual_cross_attention_cholect50.py` | `--dataset-root` → `CHOLECT50_CHALLENGE_VAL_ROOT`, `--videos-root` → `CHOLECT50_VIDEOS_ROOT` |
 
 #### 배치 실행 (`sequential_*.sh`)
 
@@ -1027,6 +1084,87 @@ BACKEND=qwen3-4b DEVICE_VISIBLE=0 \
   bash grounding_task.sh action_recognition_sarrarp50 --video 41 --max-samples 5
 ```
 
+#### CholecT50 visual cross-attention
+
+`grounding_task.sh` 기본 주입:
+
+- `--dataset-root` → `$CHOLECT50_CHALLENGE_VAL_ROOT` (`../eval/cholect50-challenge-val`)
+- `--videos-root` → `$CHOLECT50_VIDEOS_ROOT` (설정 시)
+
+**단일 프레임** (가장 흔한 사용 — GT bbox crop을 query로):
+
+```bash
+export CHOLECT50_VIDEOS_ROOT=/path/to/videos   # challenge-val/videos 등
+
+BACKEND=qwen3-4b DEVICE_VISIBLE=0 \
+  bash grounding_task.sh visual_cross_attention_cholect50 \
+    --feature-backbone hf \
+    --video VID75 --frame 525 \
+    --query-from-gt-crop
+```
+
+**SurgSigma LoRA / Qwen3-VL 32B**
+
+```bash
+BACKEND=qwen3-4b DEVICE_VISIBLE=0 \
+  MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full \
+  bash grounding_task.sh visual_cross_attention_cholect50 \
+    --feature-backbone hf --video VID75 --frame 525 --query-from-gt-crop
+
+BACKEND=qwen3-32b DEVICE_VISIBLE=0 \
+  bash grounding_task.sh visual_cross_attention_cholect50 \
+    --feature-backbone hf --video VID75 --frame 525 --query-from-gt-crop
+```
+
+**Prismatic vision backbone**
+
+```bash
+BACKEND=prismatic DEVICE_VISIBLE=0 \
+  bash grounding_task.sh visual_cross_attention_cholect50 \
+    --feature-backbone prismatic \
+    --vlm-checkpoint /path/to/step-....pt \
+    --video VID68 --frame 837 --query-from-gt-crop
+```
+
+**timm DINO+SigLIP** (`--feature-backbone timm`, 기본 — VLM vision tower 미사용):
+
+```bash
+bash grounding_task.sh visual_cross_attention_cholect50 \
+  --video VID68 --frame 837 --query-from-gt-crop
+```
+
+**배치** (instrument당 N frame, 기본 3):
+
+```bash
+BACKEND=qwen3-4b DEVICE_VISIBLE=0 \
+  bash grounding_task.sh visual_cross_attention_cholect50 \
+    --feature-backbone hf --query-from-gt-crop \
+    --samples-per-instrument 3 --seed 42
+```
+
+**reference query PNG 사용** (`assets/cholect50_query/`에 instrument별 이미지 배치):
+
+```bash
+bash grounding_task.sh visual_cross_attention_cholect50 \
+  --feature-backbone hf --backend qwen3-4b \
+  --video VID75 --frame 525 \
+  --query-dir assets/cholect50_query
+```
+
+**임의 test 이미지**
+
+```bash
+bash grounding_task.sh visual_cross_attention_cholect50 \
+  --test-image /path/to/frame.png --query-from-gt-crop
+```
+
+결과:
+
+- JSON: `outputs/visual_cross_attention_cholect50/{model_name}/cross_attention.json`
+- 시각화: `.../viz/{VID}_f{frame}_query_{instrument}_comparison.png`
+
+`--feature-backbone hf`일 때 `{model_name}`은 `--model-id` tail (예: `khtks_Qwen3-VL_surgsigma_qwen3vl_full`, `Qwen_Qwen3-VL-32B-Instruct`).
+
 ### 4.2 Python 직접 실행
 
 **CholecT50**:
@@ -1112,6 +1250,18 @@ uv run --python /path/to/hf-env/bin/python \
   --max-samples 5
 ```
 
+**CholecT50 visual cross-attention**:
+
+```bash
+uv run --python /path/to/hf-env/bin/python \
+  visual_cross_attention_cholect50.py \
+  --backend qwen3-4b \
+  --feature-backbone hf \
+  --video VID75 --frame 525 \
+  --query-from-gt-crop \
+  --videos-root /path/to/videos
+```
+
 ### 4.3 주요 CLI 인자
 
 **CholecT50 (`triplet_recognition_cholect50.py`)**
@@ -1179,6 +1329,27 @@ uv run --python /path/to/hf-env/bin/python \
 | `--max-samples N` | 최대 N개 QA쌍만 평가 |
 | `--force` / `--output` | resume·재추론·결과 경로 |
 
+**CholecT50 visual cross-attention (`visual_cross_attention_cholect50.py`)**
+
+| 인자 | 설명 |
+|------|------|
+| `--feature-backbone {timm,prismatic,hf}` | patch feature 소스 (기본: `timm`) |
+| `--query-encoding {vision_ref,pixel_grid,single,backbone}` | query token 방식 (기본: `vision_ref`) |
+| `--video` / `--frame` | 단일 challenge-val 프레임 (`--video`는 `--frame` 필수) |
+| `--test-image` | 단일 임의 이미지 (위와 상호 배타) |
+| `--eval-all` | instrument당 cap 없이 전 annotation |
+| `--query-dir` | reference query PNG 폴더 (기본: `assets/cholect50_query`) |
+| `--query-from-gt-crop` | query PNG 없을 때 GT instrument bbox crop 사용 |
+| `--samples-per-instrument N` | 배치 모드 instrument당 최대 N frame (기본 3) |
+| `--instrument` | instrument 필터 |
+| `--limit N` | 배치 최대 frame 수 |
+| `--vlm-checkpoint` / `--vlm-config` | `--feature-backbone prismatic` 시 checkpoint |
+| `--output-dir` | 결과 루트 override (기본: `outputs/visual_cross_attention_cholect50/{model_name}`) |
+| `--image-size` | timm/hf 입력 side (기본 224; prismatic은 checkpoint에서 추론) |
+| `--alpha` | heatmap overlay 투명도 (기본 0.55) |
+
+VLM `generate()` 미사용. `--feature-backbone hf`일 때만 `--backend` / `--model-id`가 vision tower 로드에 영향.
+
 **CholecT50 language grounding (`language_grounding_surgical_prompts.py`)**
 
 | 인자 | 설명 |
@@ -1234,6 +1405,17 @@ uv run --python /path/to/hf-env/bin/python \
 | Endoscapes CVS | `outputs/cvs_evaluation_endoscapes/cvs_{backend}_{model}_{protocol}_{split}/` | `endoscapes_cvs_{split}.json` |
 | SAR-RARP50 action | `outputs/action_recognition_sarrarp50/action_{backend}_{model}_{prompt_mode}/` | `sarrarp50_action_seg1hz.json` |
 | Language grounding | `outputs/language_grounding_surgical_prompts/lang_{backend}_{model}/` | `surgical_prompts.json` |
+| Visual cross-attention | `outputs/visual_cross_attention_cholect50/{model_name}/` | `cross_attention.json` (+ `viz/*.png`) |
+
+**예시 (visual cross-attention, HF Qwen3-VL 32B):**
+
+```
+outputs/visual_cross_attention_cholect50/
+  Qwen_Qwen3-VL-32B-Instruct/
+    cross_attention.json
+    viz/
+      VID75_f000525_query_clipper_comparison.png
+```
 
 **예시 (`BACKEND=cosmos-32b`, triplet, sequential_gt, mcq, eval-all):**
 
@@ -1383,9 +1565,13 @@ JSON 필드 요약:
 18. **SAR-RARP50 `Missing PNGs`** — 추출 미완료 또는 `action_discrete.txt`에 없는 stem; `--overwrite`로 재추출
 19. **SAR-RARP50 JSON 없음 (실행 중)** — JSON은 **전체 루프 종료 후**만 저장; 중단 시 viz/메모리만 있고 JSON 없을 수 있음 → 완료까지 실행 또는 `--force` 재실행
 20. **`ModuleNotFoundError: cholec50_data`** — 모듈명은 `cholect50_data` (`t` 포함); `action_recognition_sarrarp50.py` import 확인
+21. **cross-attention 프레임 없음** — `CHOLECT50_VIDEOS_ROOT` 또는 `--videos-root` 확인; `{vid}/{frame:06d}.png` 경로
+22. **cross-attention query 없음** — `assets/cholect50_query/`에 PNG 추가 또는 `--query-from-gt-crop` 사용
+23. **cross-attention timm** — `pip install timm` in `HF_PYTHON` env; `--feature-backbone hf`는 `--backend`에 맞는 transformers·PEFT 필요
 
 ```bash
 python triplet_recognition_cholect50.py --help
+python visual_cross_attention_cholect50.py --help
 python phase_recognition_cholec80.py --help
 python action_recognition_sarrarp50.py --help
 python scripts/extract_sarrarp50_frames.py --help
