@@ -132,6 +132,19 @@ def category_lookup(categories: dict[str, Any], group: str, idx: int) -> str:
     return str(g.get(str(int(idx)), g.get(str(idx), f"?{idx}")))
 
 
+def cholect_row_bbox_xyxy(row: list[Any]) -> tuple[float, float, float, float] | None:
+    """CholecT50 row bbox: indices 3–6 are normalized [x, y, w, h] (top-left + size)."""
+    if len(row) < 7:
+        return None
+    try:
+        x, y, w, h = float(row[3]), float(row[4]), float(row[5]), float(row[6])
+    except (TypeError, ValueError):
+        return None
+    if w <= 0.0 or h <= 0.0:
+        return None
+    return clamp_bbox_xyxy_01((x, y, x + w, y + h))
+
+
 def parse_annotation_row(row: list[Any], categories: dict[str, Any]) -> dict[str, Any] | None:
     if len(row) < 9:
         return None
@@ -143,6 +156,7 @@ def parse_annotation_row(row: list[Any], categories: dict[str, Any]) -> dict[str
     verb_id = int(row[7])
     target_id = int(row[8])
     phase_id = int(row[14]) if len(row) > 14 else None
+    bbox_xyxy = cholect_row_bbox_xyxy(row)
 
     inst_name = category_lookup(categories, "instrument", instrument_id)
     verb_name = category_lookup(categories, "verb", verb_id)
@@ -162,6 +176,7 @@ def parse_annotation_row(row: list[Any], categories: dict[str, Any]) -> dict[str
         "triplet_str": triplet_str,
         "phase_id": phase_id,
         "phase_name": phase_name,
+        "bbox_xyxy": bbox_xyxy,
     }
 
 
@@ -205,7 +220,7 @@ def _order_bbox_xyxy(
 
 
 def parse_raw_bbox_xyxy(text: str) -> tuple[float, float, float, float] | None:
-    """Extract xyxy from [..] or (..) without normalizing."""
+    """Extract xyxy from [..], (x1,y1,x2,y2), or (x1,y1), (x2,y2) without normalizing."""
     for pattern in (_BBOX_BRACKET_PATTERN, _BBOX_PAREN_PATTERN):
         for m in pattern.finditer(text or ""):
             try:
@@ -215,7 +230,68 @@ def parse_raw_bbox_xyxy(text: str) -> tuple[float, float, float, float] | None:
             ordered = _order_bbox_xyxy(*vals)
             if ordered is not None:
                 return ordered
+    corner_pat = re.compile(
+        r"\(\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*,\s*"
+        r"([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*\)"
+    )
+    corners = [
+        (float(m.group(1)), float(m.group(2)))
+        for m in corner_pat.finditer(text or "")
+    ]
+    if len(corners) >= 2:
+        xs = [c[0] for c in corners[:2]]
+        ys = [c[1] for c in corners[:2]]
+        return _order_bbox_xyxy(min(xs), min(ys), max(xs), max(ys))
     return None
+
+
+def clamp_bbox_xyxy_px(
+    bbox: tuple[float, float, float, float],
+    *,
+    image_width: int,
+    image_height: int,
+) -> tuple[float, float, float, float] | None:
+    w = max(1, int(image_width))
+    h = max(1, int(image_height))
+    xmin, ymin, xmax, ymax = bbox
+    xmin = max(0.0, min(float(w), xmin))
+    ymin = max(0.0, min(float(h), ymin))
+    xmax = max(0.0, min(float(w), xmax))
+    ymax = max(0.0, min(float(h), ymax))
+    return _order_bbox_xyxy(xmin, ymin, xmax, ymax)
+
+
+def parse_bbox_pixels_from_model_text(
+    text: str,
+    *,
+    bbox_parse_mode: str | None = None,
+    image_width: int,
+    image_height: int,
+) -> tuple[float, float, float, float] | None:
+    """Parse model output as pixel xyxy on the native image (no [0,1] normalization)."""
+    if bbox_parse_mode == "cosmos":
+        raw = parse_raw_bbox_xyxy(text)
+        if raw is None:
+            return None
+        scaled = bbox_qwen1000_to_normalized_01(raw)
+        if scaled is None:
+            return None
+        w, h = max(1, int(image_width)), max(1, int(image_height))
+        xmin, ymin, xmax, ymax = scaled
+        return clamp_bbox_xyxy_px(
+            (xmin * w, ymin * h, xmax * w, ymax * h),
+            image_width=image_width,
+            image_height=image_height,
+        )
+    raw = parse_raw_bbox_xyxy(text)
+    if raw is None:
+        return None
+    if max(abs(v) for v in raw) <= 1.0:
+        w, h = max(1, int(image_width)), max(1, int(image_height))
+        raw = (raw[0] * w, raw[1] * h, raw[2] * w, raw[3] * h)
+    return clamp_bbox_xyxy_px(
+        raw, image_width=image_width, image_height=image_height,
+    )
 
 
 def clamp_bbox_xyxy_01(bbox: tuple[float, float, float, float]) -> tuple[float, float, float, float] | None:
@@ -548,6 +624,34 @@ def draw_bbox_xyxy_norm(
     draw.rectangle([x0, y0, x1, y1], outline=outline, width=line_width)
 
 
+def draw_bbox_xyxy_px(
+    image: Image.Image,
+    bbox: tuple[float, float, float, float],
+    *,
+    outline: str,
+    line_width: int = 3,
+) -> None:
+    draw = ImageDraw.Draw(image)
+    xmin, ymin, xmax, ymax = bbox
+    x0 = int(round(xmin))
+    y0 = int(round(ymin))
+    x1 = int(round(xmax))
+    y1 = int(round(ymax))
+    draw.rectangle([x0, y0, x1, y1], outline=outline, width=line_width)
+
+
+def _bbox_top_left_for_draw(
+    bbox: tuple[float, float, float, float],
+    image_size: tuple[int, int],
+    *,
+    coordinate_space: str = "norm",
+) -> tuple[int, int]:
+    if coordinate_space == "pixel":
+        xmin, ymin, _, _ = bbox
+        return int(round(xmin)), int(round(ymin))
+    return _bbox_top_left_px(bbox, image_size)
+
+
 def draw_gt_pred_comparison_visualization(
     rgb: Image.Image,
     *,
@@ -556,21 +660,25 @@ def draw_gt_pred_comparison_visualization(
     instrument: str,
     instrument_id: str | None = None,
     iou_value: float | None = None,
+    coordinate_space: str = "norm",
 ) -> Image.Image:
-    """GT=green, Pred=red on normalized [0,1] bbox coords."""
+    """GT=green, Pred=red (normalized [0,1] or pixel xyxy per coordinate_space)."""
     out = rgb.copy()
     inst_label = format_instrument_viz_label(instrument, instrument_id=instrument_id)
+    draw_fn = draw_bbox_xyxy_px if coordinate_space == "pixel" else draw_bbox_xyxy_norm
 
-    draw_bbox_xyxy_norm(out, gt_bbox, outline="#00ff00", line_width=4)
+    draw_fn(out, gt_bbox, outline="#00ff00", line_width=4)
     if pred_bbox is not None:
-        draw_bbox_xyxy_norm(out, pred_bbox, outline="#ff0000", line_width=4)
+        draw_fn(out, pred_bbox, outline="#ff0000", line_width=4)
 
     draw = ImageDraw.Draw(out)
     small = _try_font(13)
     box_font = _try_font(12)
     img_sz = out.size
 
-    gx, gy = _bbox_top_left_px(gt_bbox, img_sz)
+    gx, gy = _bbox_top_left_for_draw(
+        gt_bbox, img_sz, coordinate_space=coordinate_space,
+    )
     _draw_text_panel(
         draw,
         (gx, max(0, gy - 28)),
@@ -579,7 +687,9 @@ def draw_gt_pred_comparison_visualization(
         bg=(0, 80, 0),
     )
     if pred_bbox is not None:
-        px, py = _bbox_top_left_px(pred_bbox, img_sz)
+        px, py = _bbox_top_left_for_draw(
+            pred_bbox, img_sz, coordinate_space=coordinate_space,
+        )
         _draw_text_panel(
             draw,
             (px, max(0, py - 28)),
@@ -810,15 +920,19 @@ def draw_single_bbox_visualization(
     instrument_id: str | None = None,
     outline: str,
     panel_bg: tuple[int, int, int] = (0, 0, 0),
+    coordinate_space: str = "norm",
 ) -> Image.Image:
     out = rgb.copy()
-    draw_bbox_xyxy_norm(out, bbox, outline=outline, line_width=4)
+    draw_fn = draw_bbox_xyxy_px if coordinate_space == "pixel" else draw_bbox_xyxy_norm
+    draw_fn(out, bbox, outline=outline, line_width=4)
     draw = ImageDraw.Draw(out)
     small = _try_font(13)
     box_font = _try_font(12)
     inst_label = format_instrument_viz_label(instrument, instrument_id=instrument_id)
 
-    bx, by = _bbox_top_left_px(bbox, out.size)
+    bx, by = _bbox_top_left_for_draw(
+        bbox, out.size, coordinate_space=coordinate_space,
+    )
     _draw_text_panel(
         draw,
         (bx, max(0, by - 28)),

@@ -149,6 +149,7 @@ Usage:
   BACKEND=<backend> bash grounding_task.sh tissue_instrument_recognition_endovis18 [args...]
   BACKEND=<backend> bash grounding_task.sh cvs_evaluation_endoscapes [args...]
   BACKEND=<backend> bash grounding_task.sh language_grounding_surgical_prompts [args...]
+  bash grounding_task.sh visual_cross_attention_cholect50 --video VID68 --frame 837 --query-from-gt-crop
 
 Language grounding uses text-only inference (no image). Compatible backends:
   prismatic, hf, qwen3-*, cosmos-*, internvl3.5, paligemma2, groot, openai, gemini, claude
@@ -204,6 +205,7 @@ case "$task" in
   cvs_evaluation_endoscapes) script="cvs_evaluation_endoscapes.py" ;;
   action_recognition_sarrarp50) script="action_recognition_sarrarp50.py" ;;
   language_grounding_surgical_prompts) script="language_grounding_surgical_prompts.py" ;;
+  visual_cross_attention_cholect50) script="visual_cross_attention_cholect50.py" ;;
   -h|--help|help) usage; exit 0 ;;
   *)
     echo "ERROR: unknown task '$task'" >&2
@@ -241,7 +243,7 @@ set -- "$@" --backend "$backend"
 : "${DEVICE_VISIBLE:=0}"
 export CUDA_VISIBLE_DEVICES="$DEVICE_VISIBLE"
 
-if [[ "$task" == "triplet_recognition_cholect50" ]]; then
+if [[ "$task" == "triplet_recognition_cholect50" || "$task" == "visual_cross_attention_cholect50" ]]; then
   ! has_flag "--dataset-root" "$@" && set -- "$@" --dataset-root "$CHOLECT50_CHALLENGE_VAL_ROOT"
   [[ -n "$CHOLECT50_VIDEOS_ROOT" ]] && ! has_flag "--videos-root" "$@" && set -- "$@" --videos-root "$CHOLECT50_VIDEOS_ROOT"
 fi

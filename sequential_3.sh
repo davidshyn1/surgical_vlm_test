@@ -6,11 +6,20 @@
 # BACKEND=qwen3-4b DEVICE_VISIBLE=2 MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full   bash grounding_task.sh cvs_evaluation_endoscapes
 
 
-# BACKEND=cosmos-32b DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --viz
-# BACKEND=internvl3.5 DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --viz
-# BACKEND=paligemma2 DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --viz
-# BACKEND=qwen2.5 DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --viz
-# BACKEND=qwen3-4b DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --viz
-# BACKEND=qwen3-32b DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --viz
-# BACKEND=cosmos-2b DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --viz
-# BACKEND=qwen3-4b DEVICE_VISIBLE=2 MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full   bash grounding_task.sh instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --viz
+# BACKEND=cosmos-32b DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --instrument-taxonomy cholect50 --viz 
+# BACKEND=internvl3.5 DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --instrument-taxonomy cholect50 --viz
+# BACKEND=paligemma2 DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --instrument-taxonomy cholect50 --viz
+# BACKEND=qwen2.5 DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --instrument-taxonomy cholect50 --viz
+# BACKEND=qwen3-4b DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --instrument-taxonomy cholect50 --viz
+# BACKEND=qwen3-32b DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --instrument-taxonomy cholect50 --viz
+# BACKEND=cosmos-2b DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --instrument-taxonomy cholect50 --viz
+BACKEND=qwen3-4b DEVICE_VISIBLE=2 MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full   bash grounding_task.sh instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --viz
+
+BACKEND=qwen3-4b DEVICE_VISIBLE=2 \
+  MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full \
+  bash grounding_task.sh instrument_localization_endovis17 \
+  --prompt-format pixel_compact \
+  --min-component-pixels 50 \
+  --bbox-mode filtered_union \
+  --max-samples 50 \
+  --viz

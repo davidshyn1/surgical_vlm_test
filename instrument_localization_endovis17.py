@@ -36,7 +36,10 @@ from endovis17_data import (
     DEFAULT_DATASET_ROOT,
     DEFAULT_MIN_COMPONENT_PIXELS,
     ENDOVIS2017_IMAGE_SIZE,
+    ENDOVIS_SLUG_TO_CHOLECT50,
     BboxMode,
+    InstrumentTaxonomy,
+    PromptFormat,
     build_instrument_localization_prompt,
     collect_localization_samples,
     export_bbox_annotations,
@@ -52,6 +55,7 @@ from utils import (
     iou_xyxy,
     load_results_for_resume,
     parse_bbox_from_model_text,
+    parse_bbox_pixels_from_model_text,
     resolve_device,
     strip_lora_answer_tags,
     upsert_result,
@@ -60,7 +64,39 @@ from utils import (
 _SCRIPT_ROOT = Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_ROOT.parent
 DEFAULT_OUTPUT_ROOT = _SCRIPT_ROOT / "outputs" / "instrument_localization_endovis17"
+DEFAULT_OUTPUT_ROOT_CHOLECT50 = (
+    _SCRIPT_ROOT / "outputs" / "instrument_localization_endovis17_cholect50"
+)
 _DEFAULT_HF_TOKEN = _SCRIPT_ROOT / ".hf_token"
+
+
+def default_output_root(
+    taxonomy: InstrumentTaxonomy,
+    prompt_format: PromptFormat,
+) -> Path:
+    name = "instrument_localization_endovis17"
+    if taxonomy == "cholect50":
+        name += "_cholect50"
+    if prompt_format == "pixel_compact":
+        name += "_pixel"
+    return _SCRIPT_ROOT / "outputs" / name
+
+
+def default_results_json_name(
+    taxonomy: InstrumentTaxonomy,
+    prompt_format: PromptFormat,
+) -> str:
+    parts = ["endovis2017"]
+    if taxonomy == "cholect50":
+        parts.append("cholect50")
+    if prompt_format == "pixel_compact":
+        parts.append("pixel")
+    parts.append("instrument_localization.json")
+    return "_".join(parts)
+
+
+def coordinate_space_for_prompt_format(prompt_format: PromptFormat) -> str:
+    return "pixel" if prompt_format == "pixel_compact" else "norm"
 
 def resize_image_for_vlm(image: Image.Image, pil_side: int) -> Image.Image:
     """Square resize — same tensor geometry as VLM inference and viz overlays."""
@@ -71,10 +107,19 @@ def resize_image_for_vlm(image: Image.Image, pil_side: int) -> Image.Image:
     )
 
 
-def _viz_slug(val_split: str, frame_stem: str, instrument_id: str) -> str:
+def _viz_slug(
+    val_split: str,
+    frame_stem: str,
+    instrument_id: str,
+    *,
+    mask_class_id: int | None = None,
+) -> str:
     split = re.sub(r"[^\w.-]+", "_", val_split.strip().lower())
     inst = re.sub(r"[^\w.-]+", "_", instrument_id.strip().lower())
-    return f"{split}_{frame_stem}_{inst}"
+    base = f"{split}_{frame_stem}_{inst}"
+    if mask_class_id is not None:
+        return f"{base}_c{int(mask_class_id)}"
+    return base
 
 
 def _norm_bbox_from_field(bbox: Any) -> tuple[float, float, float, float] | None:
@@ -87,11 +132,21 @@ def _norm_bbox_from_field(bbox: Any) -> tuple[float, float, float, float] | None
     return clamp_bbox_xyxy_01(t) or t
 
 
+def _px_bbox_from_field(bbox: Any) -> tuple[float, float, float, float] | None:
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        return None
+    try:
+        return tuple(float(x) for x in bbox)
+    except (TypeError, ValueError):
+        return None
+
+
 def save_localization_visualizations(
     entry: dict[str, Any],
     image: Image.Image,
     viz_root: Path,
     *,
+    coordinate_space: str = "norm",
     force: bool = False,
 ) -> dict[str, str | None]:
     """Write GT / Pred / comparison JPEGs; return paths stored on entry."""
@@ -102,18 +157,31 @@ def save_localization_visualizations(
     }
     inp = entry.get("input") or {}
     lc = inp.get("label_context") or {}
-    gt = _norm_bbox_from_field(lc.get("label_bbox_xyxy_norm"))
+    space = str(inp.get("coordinate_space") or coordinate_space)
+    if space == "pixel":
+        gt = _px_bbox_from_field(lc.get("label_bbox_xyxy_px"))
+    else:
+        gt = _norm_bbox_from_field(lc.get("label_bbox_xyxy_norm"))
     if gt is None:
         return paths
 
     out = entry.get("output") or {}
     parsed = out.get("parsed") or {} if isinstance(out, dict) else {}
-    pred = _norm_bbox_from_field(parsed.get("bbox_xyxy_norm"))
+    if space == "pixel":
+        pred = _px_bbox_from_field(parsed.get("bbox_xyxy_px"))
+    else:
+        pred = _norm_bbox_from_field(parsed.get("bbox_xyxy_norm"))
 
     frame_stem = str(lc.get("frame_stem") or inp.get("frame_stem") or "frame")
     val_split = str(lc.get("val_split") or inp.get("val_split") or "")
     instrument_id = str(lc.get("label_instrument_id") or "")
-    slug = _viz_slug(val_split, frame_stem, instrument_id)
+    mask_cid = lc.get("mask_class_id")
+    slug = _viz_slug(
+        val_split,
+        frame_stem,
+        instrument_id,
+        mask_class_id=int(mask_cid) if mask_cid is not None else None,
+    )
 
     ev = entry.get("evaluation") or {}
     iou_v = ev.get("iou")
@@ -142,6 +210,7 @@ def save_localization_visualizations(
             instrument_id=instrument_id,
             outline="#00ff00",
             panel_bg=(0, 80, 0),
+            coordinate_space=space,
         ).save(gt_path, format="JPEG", quality=95)
     paths["visualization_gt_path"] = str(gt_path.resolve())
 
@@ -153,6 +222,7 @@ def save_localization_visualizations(
             instrument_id=instrument_id,
             outline="#ff0000",
             panel_bg=(80, 0, 0),
+            coordinate_space=space,
         ).save(pred_path, format="JPEG", quality=95)
         paths["visualization_pred_path"] = str(pred_path.resolve())
 
@@ -164,6 +234,7 @@ def save_localization_visualizations(
             instrument=inst_disp,
             instrument_id=instrument_id,
             iou_value=float(iou_v) if iou_v is not None else None,
+            coordinate_space=space,
         ).save(cmp_path, format="JPEG", quality=95)
     paths["visualization_comparison_path"] = str(cmp_path.resolve())
 
@@ -181,15 +252,19 @@ def _attach_visualization_paths(entry: dict[str, Any], paths: dict[str, str | No
                 out[key] = val
 
 
-def _row_key(sample: dict[str, Any]) -> tuple[str, str]:
+def _row_key(sample: dict[str, Any], *, prompt_format: PromptFormat) -> tuple[str, str]:
+    endovis_id = str(
+        sample.get("endovis_instrument_id") or sample.get("instrument_id") or ""
+    )
+    mask_cid = int(sample["mask_class_id"])
     tool = (
-        f"endovis2017-loc|{sample['val_split']}|"
-        f"{sample['frame_stem']}|{sample['instrument_id']}"
+        f"endovis2017-loc|{prompt_format}|{sample['val_split']}|"
+        f"{sample['frame_stem']}|{endovis_id}|c{mask_cid}"
     )
     return str(sample["img_path"]), tool
 
 
-def _should_skip_resume(rec: dict, tool: str) -> bool:
+def _should_skip_resume(rec: dict, tool: str, *, coordinate_space: str) -> bool:
     if rec.get("error"):
         return False
     inp = rec.get("input") or {}
@@ -201,7 +276,8 @@ def _should_skip_resume(rec: dict, tool: str) -> bool:
     parsed = out.get("parsed") or {}
     if parsed.get("not_present"):
         return True
-    bbox = parsed.get("bbox_xyxy_norm")
+    key = "bbox_xyxy_px" if coordinate_space == "pixel" else "bbox_xyxy_norm"
+    bbox = parsed.get(key)
     return isinstance(bbox, list) and len(bbox) == 4
 
 
@@ -211,10 +287,33 @@ def parse_localization_response(
     bbox_parse_mode: str,
     image_width: int,
     image_height: int,
+    coordinate_space: str = "norm",
 ) -> dict[str, Any]:
     raw = strip_lora_answer_tags(text)
+    empty = {
+        "not_present": True,
+        "bbox_xyxy_norm": None,
+        "bbox_xyxy_px": None,
+        "raw": raw,
+    }
+    if coordinate_space == "pixel":
+        bbox_px = parse_bbox_pixels_from_model_text(
+            raw,
+            bbox_parse_mode=bbox_parse_mode,
+            image_width=image_width,
+            image_height=image_height,
+        )
+        if bbox_px is None:
+            return {"not_present": False, "bbox_xyxy_norm": None, "bbox_xyxy_px": None, "raw": raw}
+        return {
+            "not_present": False,
+            "bbox_xyxy_norm": None,
+            "bbox_xyxy_px": [float(v) for v in bbox_px],
+            "raw": raw,
+        }
+
     if re.search(r"\bnot\s+present\b", raw, re.IGNORECASE):
-        return {"not_present": True, "bbox_xyxy_norm": None, "bbox_xyxy_px": None, "raw": raw}
+        return empty
 
     bbox_norm = parse_bbox_from_model_text(
         raw,
@@ -245,8 +344,13 @@ def _score_record(rec: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(out, dict):
         return None
     parsed = out.get("parsed") or {}
-    gt = lc.get("label_bbox_xyxy_norm")
-    pred = parsed.get("bbox_xyxy_norm")
+    space = str(inp.get("coordinate_space") or "norm")
+    if space == "pixel":
+        gt = lc.get("label_bbox_xyxy_px")
+        pred = parsed.get("bbox_xyxy_px")
+    else:
+        gt = lc.get("label_bbox_xyxy_norm")
+        pred = parsed.get("bbox_xyxy_norm")
     if not (isinstance(gt, list) and len(gt) == 4):
         return None
     iou_v: float | None = None
@@ -255,14 +359,20 @@ def _score_record(rec: dict[str, Any]) -> dict[str, Any] | None:
             tuple(float(x) for x in gt),
             tuple(float(x) for x in pred),
         )
-    return {
+    ev: dict[str, Any] = {
         "instrument_id": lc.get("label_instrument_id"),
         "region_id": lc.get("label_region_id"),
-        "gt_bbox_norm": gt,
-        "pred_bbox_norm": pred,
         "iou": iou_v,
         "not_present_pred": bool(parsed.get("not_present")),
+        "coordinate_space": space,
     }
+    if space == "pixel":
+        ev["gt_bbox_px"] = gt
+        ev["pred_bbox_px"] = pred
+    else:
+        ev["gt_bbox_norm"] = gt
+        ev["pred_bbox_norm"] = pred
+    return ev
 
 
 def aggregate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -282,8 +392,13 @@ def aggregate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
         if ev.get("not_present_pred"):
             not_present += 1
             continue
-        pred = ev.get("pred_bbox_norm")
-        gt = ev.get("gt_bbox_norm")
+        space = str(ev.get("coordinate_space") or "norm")
+        if space == "pixel":
+            pred = ev.get("pred_bbox_px")
+            gt = ev.get("gt_bbox_px")
+        else:
+            pred = ev.get("pred_bbox_norm")
+            gt = ev.get("gt_bbox_norm")
         if not (isinstance(pred, list) and len(pred) == 4):
             continue
         parsed_ok += 1
@@ -292,22 +407,52 @@ def aggregate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
         iou_v = ev.get("iou")
         if iou_v is not None:
             ious.append(float(iou_v))
-        det_records.append(
-            {
-                "instrument_id": ev.get("instrument_id") or lc.get("label_instrument_id"),
-                "image_id": lc.get("frame_stem") or inp.get("frame_stem"),
-                "frame_stem": lc.get("frame_stem") or inp.get("frame_stem"),
-                "gt_bbox_norm": gt,
-                "pred_bbox_norm": pred,
-                "score": 1.0,
-            }
-        )
+        det_row: dict[str, Any] = {
+            "instrument_id": ev.get("instrument_id") or lc.get("label_instrument_id"),
+            "image_id": lc.get("frame_stem") or inp.get("frame_stem"),
+            "frame_stem": lc.get("frame_stem") or inp.get("frame_stem"),
+            "score": 1.0,
+        }
+        if space == "pixel":
+            det_row["gt_bbox_norm"] = gt
+            det_row["pred_bbox_norm"] = pred
+        else:
+            det_row["gt_bbox_norm"] = gt
+            det_row["pred_bbox_norm"] = pred
+        det_records.append(det_row)
 
     det = compute_detection_map_metrics(det_records)
     n_scored = len(det_records)
+    n_results = len(results)
+    n_acc50_parsed = sum(1 for v in ious if v >= 0.5)
+    acc50_parsed = (n_acc50_parsed / len(ious)) if ious else None
+    # All GT samples: unparsed / missing pred counts as incorrect.
+    n_acc50_all = 0
+    per_class_total: dict[str, int] = {}
+    per_class_acc50: dict[str, int] = {}
+    for rec in results:
+        ev = rec.get("evaluation")
+        if not ev:
+            continue
+        inst = str(ev.get("instrument_id") or "")
+        if inst:
+            per_class_total[inst] = per_class_total.get(inst, 0) + 1
+        if ev.get("not_present_pred"):
+            continue
+        iou_v = ev.get("iou")
+        if iou_v is not None and float(iou_v) >= 0.5:
+            n_acc50_all += 1
+            if inst:
+                per_class_acc50[inst] = per_class_acc50.get(inst, 0) + 1
+    acc50_all = (n_acc50_all / n_results) if n_results else None
+    per_class_acc50_rate = {
+        cls: per_class_acc50.get(cls, 0) / cnt
+        for cls, cnt in sorted(per_class_total.items())
+        if cnt > 0
+    }
     return {
         "protocol": "endovis2017_instrument_localization",
-        "n_results": len(results),
+        "n_results": n_results,
         "n_scored": n_scored,
         "n_parsed_bbox": parsed_ok,
         "n_not_present": not_present,
@@ -315,6 +460,11 @@ def aggregate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
         "mAP@50": det.get("mAP@50"),
         "mAP@75": det.get("mAP@75"),
         "COCO_AP": det.get("COCO_AP"),
+        "Acc@IoU50": acc50_parsed,
+        "Acc@IoU50_all_samples": acc50_all,
+        "n_acc50_parsed": n_acc50_parsed,
+        "n_acc50_all_samples": n_acc50_all,
+        "per_class_acc50": per_class_acc50_rate,
         "per_class_ap": det.get("per_class_ap"),
         "mean_iou_all_parsed": (sum(ious) / len(ious)) if ious else None,
         "detection_detail": det,
@@ -344,11 +494,13 @@ def _run_vlm_on_sample(
             prompt_text,
             **{**gen_kw, "max_new_tokens": args.max_new_tokens},
         )
+        coord_space = coordinate_space_for_prompt_format(args.prompt_format)
         parsed = parse_localization_response(
             text,
             bbox_parse_mode=bbox_parse,
             image_width=int(sample["image_width"]),
             image_height=int(sample["image_height"]),
+            coordinate_space=coord_space,
         )
         return {"text": text, "parsed": parsed}
     except Exception as e:
@@ -362,17 +514,23 @@ def _make_result_entry(
     args: argparse.Namespace,
     frame_output: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    path_str, tool = _row_key(sample)
+    path_str, tool = _row_key(sample, prompt_format=args.prompt_format)
+    coord_space = coordinate_space_for_prompt_format(args.prompt_format)
     entry: dict[str, Any] = {
         "input": {
             "image_path": path_str,
             "tool": tool,
             "frame_stem": sample["frame_stem"],
+            "prompt_format": args.prompt_format,
+            "coordinate_space": coord_space,
             "label_context": {
                 "val_split": sample["val_split"],
                 "frame_stem": sample["frame_stem"],
                 "label_instrument_id": sample["instrument_id"],
                 "label_instrument_display": sample["instrument_display"],
+                "endovis_instrument_id": sample.get("endovis_instrument_id"),
+                "endovis_instrument_display": sample.get("endovis_instrument_display"),
+                "instrument_taxonomy": sample.get("instrument_taxonomy", "endovis17"),
                 "mask_class_id": sample["mask_class_id"],
                 "label_mask_path": str(sample.get("label_mask_path", "")),
                 "label_bbox_xyxy_px": sample["bbox_xyxy_px"],
@@ -412,6 +570,26 @@ def parse_args() -> argparse.Namespace:
         help="Val folder name (repeatable), e.g. val1. Default: all val*.",
     )
     p.add_argument("--instrument", type=str, default=None, help="Filter by instrument id slug.")
+    p.add_argument(
+        "--instrument-taxonomy",
+        choices=("endovis17", "cholect50"),
+        default="endovis17",
+        help=(
+            "Instrument names in prompts/labels: native EndoVis slugs (default) or "
+            "CholecT50-aligned labels (bipolar, grasper, scissors, …). "
+            "Resume keys always use native EndoVis class + mask_class_id."
+        ),
+    )
+    p.add_argument(
+        "--prompt-format",
+        choices=("default", "pixel_compact"),
+        default="default",
+        help=(
+            "default: normalized [0,1] bbox prompt with format instructions. "
+            "pixel_compact: minimal prompt with pixel (x1,y1),(x2,y2) on native image; "
+            "viz uses original 512x512 image."
+        ),
+    )
     p.add_argument("--frame", type=str, default=None, help="Single frame stem, e.g. seq_1_frame225.")
     p.add_argument("--min-mask-pixels", type=int, default=1, help="Min mask pixels for GT bbox.")
     p.add_argument(
@@ -442,7 +620,17 @@ def parse_args() -> argparse.Namespace:
         help="Random subsample cap (debug). Omit for full val set.",
     )
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    p.add_argument(
+        "--output-root",
+        type=Path,
+        default=None,
+        help=(
+            "Output directory root. Default: "
+            "outputs/instrument_localization_endovis17 or "
+            "outputs/instrument_localization_endovis17[_cholect50][_pixel] "
+            "from --instrument-taxonomy and --prompt-format."
+        ),
+    )
     p.add_argument("--output", type=Path, default=None)
     p.add_argument("--model-id", type=str, default=None)
     p.add_argument(
@@ -487,6 +675,9 @@ def main() -> None:
     val_splits = args.val_split or list_val_splits(dataset_root)
 
     bbox_mode: BboxMode = args.bbox_mode
+    instrument_taxonomy: InstrumentTaxonomy = args.instrument_taxonomy
+    prompt_format: PromptFormat = args.prompt_format
+    coordinate_space = coordinate_space_for_prompt_format(prompt_format)
     samples = collect_localization_samples(
         dataset_root=dataset_root,
         val_splits=val_splits,
@@ -495,6 +686,7 @@ def main() -> None:
         min_mask_pixels=args.min_mask_pixels,
         bbox_mode=bbox_mode,
         min_component_pixels=args.min_component_pixels,
+        instrument_taxonomy=instrument_taxonomy,
     )
     if not samples:
         raise RuntimeError(
@@ -509,6 +701,7 @@ def main() -> None:
             dataset_root=dataset_root,
             bbox_mode=bbox_mode,
             min_component_pixels=args.min_component_pixels,
+            instrument_taxonomy=instrument_taxonomy,
         )
         print(
             f"Exported {len(samples)} mask-derived bbox samples to {args.export_annotations}",
@@ -522,15 +715,14 @@ def main() -> None:
 
     model_id = resolve_model_id(args.backend, args.model_id)
     model_name = resolve_output_model_name(args.backend, model_id, args.model_name)
-    out_root = args.output_root.resolve()
+    out_root = (
+        args.output_root or default_output_root(instrument_taxonomy, prompt_format)
+    ).resolve()
+    results_json = default_results_json_name(instrument_taxonomy, prompt_format)
     out_path = (
         args.output.resolve()
         if args.output is not None
-        else (
-            out_root
-            / f"loc_{args.backend}_{model_name}"
-            / "endovis2017_instrument_localization.json"
-        ).resolve()
+        else (out_root / f"loc_{args.backend}_{model_name}" / results_json).resolve()
     )
     viz_root = out_path.parent / "visualizations"
 
@@ -555,8 +747,12 @@ def main() -> None:
             if not img_path:
                 continue
             try:
-                vlm_image = resize_image_for_vlm(
-                    Image.open(img_path), pil_side,
+                native_image = Image.open(img_path).convert("RGB")
+                rec_space = str(inp.get("coordinate_space") or coordinate_space)
+                viz_image = (
+                    native_image
+                    if rec_space == "pixel"
+                    else resize_image_for_vlm(native_image, pil_side)
                 )
             except Exception as e:
                 print(f"SKIP viz {img_path}: {e}", file=sys.stderr)
@@ -566,14 +762,25 @@ def main() -> None:
                 if ev:
                     rec["evaluation"] = ev
             paths = save_localization_visualizations(
-                rec, vlm_image, viz_root, force=args.force,
+                rec,
+                viz_image,
+                viz_root,
+                coordinate_space=rec_space,
+                force=args.force,
             )
             _attach_visualization_paths(rec, paths)
             n_viz += 1
         payload["visualization_root"] = str(viz_root.resolve())
         payload["visualization_count"] = n_viz
         payload["vlm_input_side"] = pil_side
-        payload["visualization_image_size"] = [pil_side, pil_side]
+        if coordinate_space == "pixel":
+            payload["visualization_image_size"] = [
+                ENDOVIS2017_IMAGE_SIZE,
+                ENDOVIS2017_IMAGE_SIZE,
+            ]
+            payload["visualization_note"] = "Native 512x512 BMP; pixel bbox overlays."
+        else:
+            payload["visualization_image_size"] = [pil_side, pil_side]
         with out_path.open("w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         print(
@@ -587,6 +794,9 @@ def main() -> None:
         f"EndoVis 2017 localization: samples={len(samples)}, "
         f"frames={len({s['frame_stem'] for s in samples})}, "
         f"splits={sorted({s['val_split'] for s in samples})}, "
+        f"instrument_taxonomy={instrument_taxonomy}, "
+        f"prompt_format={prompt_format}, coordinate_space={coordinate_space}, "
+        f"output={out_path}, "
         f"image={ENDOVIS2017_IMAGE_SIZE}x{ENDOVIS2017_IMAGE_SIZE} (native BMP).",
         file=sys.stderr,
     )
@@ -622,14 +832,17 @@ def main() -> None:
         frame_output: dict[str, Any] | None,
         *,
         vlm_image: Image.Image | None = None,
+        native_image: Image.Image | None = None,
     ) -> dict[str, Any]:
         inst = sample["instrument_id"]
         if inst not in prompt_cache:
             prompt_cache[inst] = build_instrument_localization_prompt(
                 instrument_id=inst,
+                taxonomy=instrument_taxonomy,
+                prompt_format=prompt_format,
             )
         user_prompt = prompt_cache[inst]
-        row_key = _row_key(sample)
+        row_key = _row_key(sample, prompt_format=prompt_format)
         entry = _make_result_entry(
             sample=sample,
             user_prompt=user_prompt,
@@ -639,22 +852,34 @@ def main() -> None:
         ev = _score_record(entry)
         if ev:
             entry["evaluation"] = ev
-        if args.viz and vlm_image is not None:
-            paths = save_localization_visualizations(
-                entry, vlm_image, viz_root, force=args.force,
+        if args.viz:
+            viz_image = (
+                native_image
+                if coordinate_space == "pixel" and native_image is not None
+                else vlm_image
             )
-            _attach_visualization_paths(entry, paths)
+            if viz_image is not None:
+                paths = save_localization_visualizations(
+                    entry,
+                    viz_image,
+                    viz_root,
+                    coordinate_space=coordinate_space,
+                    force=args.force,
+                )
+                _attach_visualization_paths(entry, paths)
         upsert_result(results, key_to_idx, row_key, entry)
         return entry
 
     for sample in samples:
-        row_key = _row_key(sample)
+        row_key = _row_key(sample, prompt_format=prompt_format)
         path_str, tool = row_key
 
         if (
             not args.force
             and row_key in key_to_idx
-            and _should_skip_resume(results[key_to_idx[row_key]], tool)
+            and _should_skip_resume(
+                results[key_to_idx[row_key]], tool, coordinate_space=coordinate_space,
+            )
         ):
             rec = results[key_to_idx[row_key]]
             ev = _score_record(rec)
@@ -662,11 +887,17 @@ def main() -> None:
                 rec["evaluation"] = ev
             if args.viz:
                 try:
-                    vlm_image = resize_image_for_vlm(
-                        Image.open(sample["img_path"]), pil_side,
+                    native_image = Image.open(sample["img_path"]).convert("RGB")
+                    vlm_image = resize_image_for_vlm(native_image, pil_side)
+                    viz_image = (
+                        native_image if coordinate_space == "pixel" else vlm_image
                     )
                     paths = save_localization_visualizations(
-                        rec, vlm_image, viz_root, force=args.force,
+                        rec,
+                        viz_image,
+                        viz_root,
+                        coordinate_space=coordinate_space,
+                        force=args.force,
                     )
                     _attach_visualization_paths(rec, paths)
                     upsert_result(results, key_to_idx, row_key, rec)
@@ -678,9 +909,8 @@ def main() -> None:
             continue
 
         try:
-            vlm_image = resize_image_for_vlm(
-                Image.open(sample["img_path"]), pil_side,
-            )
+            native_image = Image.open(sample["img_path"]).convert("RGB")
+            vlm_image = resize_image_for_vlm(native_image, pil_side)
         except Exception as e:
             print(f"SKIP {sample['frame_stem']}: {e}", file=sys.stderr)
             _upsert_scored(sample, {"error": str(e)})
@@ -690,6 +920,8 @@ def main() -> None:
         if inst not in prompt_cache:
             prompt_cache[inst] = build_instrument_localization_prompt(
                 instrument_id=inst,
+                taxonomy=instrument_taxonomy,
+                prompt_format=prompt_format,
             )
 
         frame_output = _run_vlm_on_sample(
@@ -702,7 +934,12 @@ def main() -> None:
             bbox_parse=bbox_parse,
         )
         vlm_calls += 1
-        _upsert_scored(sample, frame_output, vlm_image=vlm_image)
+        _upsert_scored(
+            sample,
+            frame_output,
+            vlm_image=vlm_image,
+            native_image=native_image,
+        )
 
         if vlm_calls % 25 == 0:
             print(f"  ... {vlm_calls} VLM calls", file=sys.stderr)
@@ -716,13 +953,27 @@ def main() -> None:
                 rec["evaluation"] = ev
 
     metrics = aggregate_metrics(results)
+    example_inst = (
+        "grasper" if instrument_taxonomy == "cholect50" else "large_needle_driver"
+    )
     example_prompt = build_instrument_localization_prompt(
-        instrument_id="large_needle_driver",
+        instrument_id=example_inst,
+        taxonomy=instrument_taxonomy,
+        prompt_format=prompt_format,
+    )
+    bbox_fmt = (
+        "(x1,y1), (x2,y2) pixel coords on native image"
+        if prompt_format == "pixel_compact"
+        else "[x_min, y_min, x_max, y_max] normalized"
     )
     payload = {
         "task": "instrument_localization",
         "eval_protocol": "endovis2017_instrument_localization",
         "dataset": "endovis2017",
+        "instrument_taxonomy": instrument_taxonomy,
+        "prompt_format": prompt_format,
+        "coordinate_space": coordinate_space,
+        "endovis_to_cholect50_instrument": dict(ENDOVIS_SLUG_TO_CHOLECT50),
         "dataset_root": str(dataset_root),
         "val_splits": sorted({s["val_split"] for s in samples}),
         "gt_source": (
@@ -733,24 +984,40 @@ def main() -> None:
         "min_component_pixels": int(args.min_component_pixels),
         "native_image_size": [ENDOVIS2017_IMAGE_SIZE, ENDOVIS2017_IMAGE_SIZE],
         "vlm_input_side": pil_side,
-        "visualization_image_size": [pil_side, pil_side],
+        "visualization_image_size": (
+            [ENDOVIS2017_IMAGE_SIZE, ENDOVIS2017_IMAGE_SIZE]
+            if coordinate_space == "pixel"
+            else [pil_side, pil_side]
+        ),
         "backend": args.backend,
         "model_id": meta.get("model_id") if meta.get("source") == "local_checkpoint" else model_id,
         "hub_model_id_cli": model_id,
         "model_name": model_name,
         "vlm_load": meta,
         "user_prompt_template_example": example_prompt,
-        "bbox_output_format": "[x_min, y_min, x_max, y_max]",
+        "bbox_output_format": bbox_fmt,
         "metrics_description": {
-            "mIoU": "Mean IoU between predicted and GT boxes (normalized xyxy).",
+            "mIoU": (
+                "Mean IoU between predicted and GT boxes (pixel xyxy)."
+                if coordinate_space == "pixel"
+                else "Mean IoU between predicted and GT boxes (normalized xyxy)."
+            ),
             "mAP@50": "Mean AP across instrument classes at IoU=0.5.",
             "mAP@75": "Mean AP across instrument classes at IoU=0.75.",
             "COCO_AP": "Mean of mAP at IoU thresholds 0.5:0.05:0.95.",
+            "Acc@IoU50": "Fraction of parsed predictions with IoU >= 0.5 (n_scored).",
+            "Acc@IoU50_all_samples": (
+                "Fraction of all GT samples with IoU >= 0.5; unparsed = incorrect."
+            ),
         },
         "vlm_forward_passes": vlm_calls,
         "visualization_root": str(viz_root.resolve()) if args.viz else None,
         "visualization_layout": {
-            "note": "Overlays on VLM square resize (pil_side), normalized bbox coords.",
+            "note": (
+                "Overlays on native 512x512 BMP; pixel bbox coords."
+                if coordinate_space == "pixel"
+                else "Overlays on VLM square resize (pil_side), normalized bbox coords."
+            ),
             "gt": "visualizations/gt/{split}_{frame}_{instrument}_gt.jpg",
             "pred": "visualizations/pred/{split}_{frame}_{instrument}_pred.jpg",
             "comparison": "visualizations/comparison/{split}_{frame}_{instrument}_gt_pred.jpg",
@@ -767,6 +1034,7 @@ def main() -> None:
     print(
         f"Wrote {len(results)} entries to {out_path}\n"
         f"  mIoU={m.get('mIoU')}\n"
+        f"  Acc@IoU50={m.get('Acc@IoU50')}  Acc@IoU50_all={m.get('Acc@IoU50_all_samples')}\n"
         f"  mAP@50={m.get('mAP@50')}  mAP@75={m.get('mAP@75')}  COCO_AP={m.get('COCO_AP')}",
         file=sys.stderr,
     )

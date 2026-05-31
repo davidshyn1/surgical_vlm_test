@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 import re
@@ -139,6 +140,12 @@ def collect_instrument_annotations(
     return items
 
 
+def _instrument_shuffle_seed(base_seed: int, instrument: str) -> int:
+    """Stable per-instrument RNG seed (``hash(str)`` is randomized across Python runs)."""
+    digest = hashlib.md5(f"{base_seed}:{instrument}".encode()).digest()
+    return int.from_bytes(digest[:4], "big")
+
+
 def sample_by_instrument(items: list[dict[str, Any]], cap_per_instrument: int, seed: int) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for it in items:
@@ -146,6 +153,6 @@ def sample_by_instrument(items: list[dict[str, Any]], cap_per_instrument: int, s
     selected: list[dict[str, Any]] = []
     for inst in sorted(grouped.keys()):
         pool = list(grouped[inst])
-        random.Random(seed ^ hash(inst)).shuffle(pool)
+        random.Random(_instrument_shuffle_seed(seed, inst)).shuffle(pool)
         selected.extend(pool[: max(0, cap_per_instrument)])
     return selected

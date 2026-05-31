@@ -13,6 +13,38 @@
 # BACKEND=qwen2.5 DEVICE_VISIBLE=0 bash grounding_task.sh tissue_instrument_recognition_endovis18
 # BACKEND=qwen2.5 DEVICE_VISIBLE=0 bash grounding_task.sh cvs_evaluation_endoscapes
 
-BACKEND=paligemma2 DEVICE_VISIBLE=0 bash grounding_task.sh phase_recognition_cholec80
-BACKEND=qwen3-4b DEVICE_VISIBLE=0 bash grounding_task.sh phase_recognition_cholec80
-BACKEND=qwen3-32b DEVICE_VISIBLE=0 bash grounding_task.sh phase_recognition_cholec80
+# BACKEND=paligemma2 DEVICE_VISIBLE=0 bash grounding_task.sh phase_recognition_cholec80
+# BACKEND=qwen3-4b DEVICE_VISIBLE=0 bash grounding_task.sh phase_recognition_cholec80
+# BACKEND=qwen3-32b DEVICE_VISIBLE=0 bash grounding_task.sh phase_recognition_cholec80
+BACKEND=qwen3-4b MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full DEVICE_VISIBLE=0 \
+  bash grounding_task.sh visual_cross_attention_cholect50 \
+  --feature-backbone hf \
+  --query-encoding pixel_grid \
+  --video VID68 --frame 837 \
+  --instrument hook
+
+
+BACKEND=qwen3-4b DEVICE_VISIBLE=0 \
+  MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full \
+  bash grounding_task.sh visual_cross_attention_cholect50 \
+  --feature-backbone hf \
+  --query-encoding pixel_grid \
+  --samples-per-instrument 5 \
+  --seed 40
+
+
+BACKEND=qwen3-4b DEVICE_VISIBLE=0 \
+  bash grounding_task.sh visual_cross_attention_cholect50 \
+  --feature-backbone hf \
+  --query-encoding vision_ref \
+  --samples-per-instrument 5 \
+  --seed 40
+
+  BACKEND=qwen3-4b DEVICE_VISIBLE=0 \
+  MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full \
+  bash grounding_task.sh visual_cross_attention_cholect50 \
+  --feature-backbone hf \
+  --query-encoding vision_ref \
+  --instrument hook \
+  --samples-per-instrument 20 \
+  --seed 40

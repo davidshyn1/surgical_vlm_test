@@ -22,13 +22,40 @@ MAPPING_FILENAME = "instrument_type_mapping.json"
 
 ENDOVIS2017_IMAGE_SIZE = 512
 ACTIVE_CLASS_IDS = (1, 2, 3, 4, 6)  # present in val masks; 5,7 unused
+# Grasping Retractor (5) included when aligning to CholecT50 (maps to grasper); 7=Other skipped
+CHOLECT50_ACTIVE_CLASS_IDS = (1, 2, 3, 4, 5, 6)
+
+InstrumentTaxonomy = Literal["endovis17", "cholect50"]
+PromptFormat = Literal["default", "pixel_compact"]
+
+# EndoVis mask slug (from instrument_type_mapping.json) -> CholecT50 triplet instrument label
+ENDOVIS_SLUG_TO_CHOLECT50: dict[str, str | None] = {
+    "bipolar_forceps": "bipolar",
+    "prograsp_forceps": "grasper",
+    "grasping_retractor": "grasper",
+    "large_needle_driver": "grasper",
+    "vessel_sealer": "bipolar",
+    "monopolar_curved_scissors": "scissors",
+    "other": None,
+}
+
+CHOLECT50_INSTRUMENT_LABELS: tuple[str, ...] = (
+    "bipolar",
+    "clipper",
+    "grasper",
+    "hook",
+    "irrigator",
+    "scissors",
+)
 
 INSTRUMENT_DISPLAY: dict[str, str] = {
     "bipolar_forceps": "Bipolar Forceps",
     "prograsp_forceps": "Prograsp Forceps",
     "large_needle_driver": "Large Needle Driver",
     "vessel_sealer": "Vessel Sealer",
+    "grasping_retractor": "Grasping Retractor",
     "monopolar_curved_scissors": "Monopolar Curved Scissors",
+    "other": "Other",
 }
 
 INSTRUMENT_IDS = tuple(INSTRUMENT_DISPLAY.keys())
@@ -63,6 +90,81 @@ def load_class_mapping(dataset_root: Path) -> tuple[dict[int, str], dict[int, st
 def instrument_display_name(instrument_id: str) -> str:
     key = (instrument_id or "").strip().lower()
     return INSTRUMENT_DISPLAY.get(key, key.replace("_", " ").title())
+
+
+def cholect50_instrument_prompt_name(label: str) -> str:
+    """CholecT50-style instrument name for prompts (lowercase vocab term)."""
+    return (label or "").strip().lower()
+
+
+def map_endovis_slug_to_cholect50(endovis_slug: str) -> str | None:
+    key = (endovis_slug or "").strip().lower()
+    if key in ENDOVIS_SLUG_TO_CHOLECT50:
+        return ENDOVIS_SLUG_TO_CHOLECT50[key]
+    return key if key in CHOLECT50_INSTRUMENT_LABELS else None
+
+
+def apply_instrument_taxonomy(
+    sample: dict[str, Any],
+    *,
+    taxonomy: InstrumentTaxonomy = "endovis17",
+) -> dict[str, Any] | None:
+    """
+    Set prompt/label instrument fields. Keeps ``endovis_instrument_id`` for unique keys.
+
+    Returns None when CholecT50 mode maps the class to null (e.g. EndoVis Other).
+    """
+    out = dict(sample)
+    endovis_id = str(
+        out.get("endovis_instrument_id") or out.get("instrument_id") or ""
+    ).strip().lower()
+    endovis_disp = str(
+        out.get("endovis_instrument_display") or out.get("instrument_display") or ""
+    )
+    if not endovis_id:
+        return None
+    out["endovis_instrument_id"] = endovis_id
+    out["endovis_instrument_display"] = endovis_disp or instrument_display_name(endovis_id)
+
+    if taxonomy == "endovis17":
+        out["instrument_id"] = endovis_id
+        out["instrument_display"] = out["endovis_instrument_display"]
+        out["instrument_taxonomy"] = "endovis17"
+        return out
+
+    if taxonomy != "cholect50":
+        raise ValueError(f"Unknown instrument taxonomy {taxonomy!r}")
+
+    cholect_label = map_endovis_slug_to_cholect50(endovis_id)
+    if cholect_label is None:
+        return None
+    out["instrument_id"] = cholect_label
+    out["instrument_display"] = cholect50_instrument_prompt_name(cholect_label)
+    out["instrument_taxonomy"] = "cholect50"
+    return out
+
+
+def build_instrument_localization_prompt(
+    *,
+    instrument_id: str,
+    taxonomy: InstrumentTaxonomy = "endovis17",
+    prompt_format: PromptFormat = "default",
+) -> str:
+    if taxonomy == "cholect50":
+        inst = cholect50_instrument_prompt_name(instrument_id)
+    else:
+        inst = instrument_display_name(instrument_id)
+    if prompt_format == "pixel_compact":
+        return (
+            f"Given the surgical image, locate all the tools in the format of "
+            f"bbox (x1,y1), (x2,y2)"
+        )
+    return (
+        f"Where is the {inst} located? Answer the question with just a bounding box.\n"
+        "Format: [x_min, y_min, x_max, y_max]\n"
+        "Use normalized coordinates in [0, 1] relative to the image you see.\n"
+        f"If the {inst} is not in the image, answer exactly: not present"
+    )
 
 
 def bbox_pixels_to_normalized(
@@ -250,16 +352,6 @@ def extract_instrument_boxes_from_mask(
     return boxes
 
 
-def build_instrument_localization_prompt(*, instrument_id: str) -> str:
-    inst = instrument_display_name(instrument_id)
-    return (
-        f"Where is the {inst} located? Answer the question with just a bounding box.\n"
-        "Format: [x_min, y_min, x_max, y_max]\n"
-        "Use normalized coordinates in [0, 1] relative to the image you see.\n"
-        f"If the {inst} is not in the image, answer exactly: not present"
-    )
-
-
 def list_val_splits(dataset_root: Path) -> list[str]:
     return sorted(
         p.name
@@ -277,9 +369,15 @@ def collect_localization_samples(
     min_mask_pixels: int = 1,
     bbox_mode: BboxMode = DEFAULT_BBOX_MODE,
     min_component_pixels: int = DEFAULT_MIN_COMPONENT_PIXELS,
+    instrument_taxonomy: InstrumentTaxonomy = "endovis17",
 ) -> list[dict[str, Any]]:
     root = dataset_root.resolve()
     class_id_to_slug, class_id_to_display = load_class_mapping(root)
+    active_ids = (
+        CHOLECT50_ACTIVE_CLASS_IDS
+        if instrument_taxonomy == "cholect50"
+        else ACTIVE_CLASS_IDS
+    )
     inst_filter = (instrument_filter or "").strip().lower() or None
     stem_f = (frame_stem_filter or "").strip() or None
     splits = val_splits or list_val_splits(root)
@@ -308,31 +406,38 @@ def collect_localization_samples(
                 class_id_to_slug=class_id_to_slug,
                 class_id_to_display=class_id_to_display,
                 min_pixels=min_mask_pixels,
+                active_class_ids=active_ids,
                 bbox_mode=bbox_mode,
                 min_component_pixels=min_component_pixels,
             )
             for box in boxes:
-                if inst_filter and box["instrument_id"] != inst_filter:
-                    continue
-                samples.append(
-                    {
-                        "val_split": split_name,
-                        "frame_stem": stem,
-                        "line_no": int(box["mask_class_id"]),
-                        "img_path": str(image_path.resolve()),
-                        "label_mask_path": str(label_path.resolve()),
-                        "instrument_id": box["instrument_id"],
-                        "instrument_display": box["instrument_display"],
-                        "mask_class_id": box["mask_class_id"],
-                        "bbox_xyxy_px": box["bbox_xyxy_px"],
-                        "bbox_xyxy_norm": box["bbox_xyxy_norm"],
-                        "mask_pixel_count": box["mask_pixel_count"],
-                        "image_width": int(w),
-                        "image_height": int(h),
-                        "region_id": "",
-                        "region_display": "",
-                    }
+                raw_sample = {
+                    "val_split": split_name,
+                    "frame_stem": stem,
+                    "line_no": int(box["mask_class_id"]),
+                    "img_path": str(image_path.resolve()),
+                    "label_mask_path": str(label_path.resolve()),
+                    "endovis_instrument_id": box["instrument_id"],
+                    "endovis_instrument_display": box["instrument_display"],
+                    "instrument_id": box["instrument_id"],
+                    "instrument_display": box["instrument_display"],
+                    "mask_class_id": box["mask_class_id"],
+                    "bbox_xyxy_px": box["bbox_xyxy_px"],
+                    "bbox_xyxy_norm": box["bbox_xyxy_norm"],
+                    "mask_pixel_count": box["mask_pixel_count"],
+                    "image_width": int(w),
+                    "image_height": int(h),
+                    "region_id": "",
+                    "region_display": "",
+                }
+                mapped = apply_instrument_taxonomy(
+                    raw_sample, taxonomy=instrument_taxonomy,
                 )
+                if mapped is None:
+                    continue
+                if inst_filter and mapped["instrument_id"] != inst_filter:
+                    continue
+                samples.append(mapped)
     return samples
 
 
@@ -343,12 +448,15 @@ def export_bbox_annotations(
     dataset_root: Path,
     bbox_mode: BboxMode = DEFAULT_BBOX_MODE,
     min_component_pixels: int = DEFAULT_MIN_COMPONENT_PIXELS,
+    instrument_taxonomy: InstrumentTaxonomy = "endovis17",
 ) -> None:
     """Write derived bbox annotations JSON for inspection / reuse."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "dataset": "endovis2017",
         "dataset_root": str(dataset_root.resolve()),
+        "instrument_taxonomy": instrument_taxonomy,
+        "endovis_to_cholect50_instrument": dict(ENDOVIS_SLUG_TO_CHOLECT50),
         "bbox_mode": bbox_mode,
         "min_component_pixels": int(min_component_pixels),
         "source": (
