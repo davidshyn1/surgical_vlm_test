@@ -36,6 +36,7 @@ import argparse
 import json
 import re
 import sys
+from collections import defaultdict
 from difflib import get_close_matches
 from io import BytesIO
 from pathlib import Path
@@ -66,7 +67,7 @@ from cholect50_data import (
     sample_by_instrument,
 )
 from cholect_query_match import canonical_label_key, query_matches_frame_labels
-from utils import CHOLECT_ROOT, load_label_json, parse_annotation_row, resolve_device
+from utils import CHOLECT_ROOT, iou_xyxy, load_label_json, normalize_instrument_name, parse_annotation_row, resolve_device
 
 _SCRIPT_ROOT = Path(__file__).resolve().parent
 _DEFAULT_OUTPUT_ROOT = _SCRIPT_ROOT / "outputs" / "visual_cross_attention_cholect50"
@@ -76,6 +77,8 @@ _DEFAULT_HF_TOKEN = _SCRIPT_ROOT / ".hf_token"
 DEFAULT_IMAGE_SIZE = 224
 METHODS = ["cls_softmax", "mean_cosine", "patch_cross_mean", "patch_cross_max"]
 COMPARISON_METHODS = ["patch_cross_max"]
+SUMMARY_ATTENTION_METHOD = "patch_cross_max"
+ATTENTION_BBOX_PERCENTILE = 75.0
 # Scale normalized cosine logits before softmax (higher → peakier; lower → broader blobs).
 CLS_SOFTMAX_LOGIT_SCALE = 5.0
 PATCH_CROSS_MEAN_LOGIT_SCALE = 12.0
@@ -244,6 +247,220 @@ def attention_bbox_stats(
         "n_instrument_patches": int(inst_mask.sum()),
         "n_background_patches": int((~inst_mask).sum()),
     }
+
+
+def instrument_key_for_record(instrument: str, ann: dict[str, Any]) -> str:
+    """Stable per-instrument slug for aggregation (EndoVis id or CholecT50 norm)."""
+    iid = str(ann.get("instrument_id") or "").strip().lower()
+    if iid:
+        return iid
+    key = canonical_label_key(instrument)
+    if key:
+        return key.replace("-", "_")
+    return normalize_instrument_name(instrument).replace("-", "_")
+
+
+def bbox_from_attention_map(
+    attn_map: np.ndarray,
+    grid_h: int,
+    grid_w: int,
+    *,
+    percentile: float = ATTENTION_BBOX_PERCENTILE,
+) -> tuple[float, float, float, float] | None:
+    """Tight normalized xyxy bbox over high-attention patches (fallback: argmax patch)."""
+    grid = attn_map.reshape(grid_h, grid_w).astype(np.float32)
+    thr = float(np.percentile(grid, percentile))
+    mask = grid >= thr
+    if not mask.any():
+        r, c = np.unravel_index(int(grid.argmax()), grid.shape)
+        mask = np.zeros_like(grid, dtype=bool)
+        mask[r, c] = True
+    rows = np.where(mask.any(axis=1))[0]
+    cols = np.where(mask.any(axis=0))[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return None
+    r0, r1 = int(rows[0]), int(rows[-1])
+    c0, c1 = int(cols[0]), int(cols[-1])
+    return (c0 / grid_w, r0 / grid_h, (c1 + 1) / grid_w, (r1 + 1) / grid_h)
+
+
+def attention_bbox_miou(
+    attn_map: np.ndarray,
+    bbox_xyxy: tuple[float, float, float, float],
+    grid_h: int,
+    grid_w: int,
+) -> tuple[float, tuple[float, float, float, float] | None]:
+    """IoU between GT bbox and bbox from thresholded attention map (patch grid)."""
+    pred = bbox_from_attention_map(attn_map, grid_h, grid_w)
+    if pred is None:
+        return 0.0, None
+    return float(iou_xyxy(pred, bbox_xyxy)), pred
+
+
+def _metric_values_from_records(
+    records: list[dict[str, Any]],
+) -> tuple[list[float], list[float]]:
+    ratios = [
+        float(r["instrument_attn_ratio"])
+        for r in records
+        if r.get("instrument_attn_ratio") is not None
+    ]
+    mious = [float(r["mIoU"]) for r in records if r.get("mIoU") is not None]
+    return ratios, mious
+
+
+def _avg_block(
+    ratios: list[float],
+    mious: list[float],
+    *,
+    n_samples: int | None = None,
+) -> dict[str, Any]:
+    n = n_samples if n_samples is not None else max(len(ratios), len(mious))
+    ratio_avg = (sum(ratios) / len(ratios)) if ratios else None
+    miou_avg = (sum(mious) / len(mious)) if mious else None
+    return {
+        "n_samples": n,
+        "instrument_attn_ratio_avg": (
+            round(ratio_avg, 6) if ratio_avg is not None else None
+        ),
+        "mIoU_avg": round(miou_avg, 6) if miou_avg is not None else None,
+    }
+
+
+def overall_avg_from_summary(summary: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Top-level final averages (micro + macro) for ``cross_attention.json``."""
+    if not summary:
+        return None
+    overall = summary.get("overall") or {}
+    micro = overall.get("micro") or {}
+    macro = overall.get("macro") or summary.get("macro") or {}
+    final = overall.get("final") or micro
+    return {
+        "primary_source": summary.get("primary_source"),
+        "method": summary.get("method"),
+        "n_records": micro.get("n_samples"),
+        "n_instruments": macro.get("n_instruments"),
+        "instrument_attn_ratio_avg": final.get("instrument_attn_ratio_avg"),
+        "mIoU_avg": final.get("mIoU_avg"),
+        "micro": {
+            "instrument_attn_ratio_avg": micro.get("instrument_attn_ratio_avg"),
+            "mIoU_avg": micro.get("mIoU_avg"),
+            "n_samples": micro.get("n_samples"),
+        },
+        "macro": {
+            "instrument_attn_ratio_avg": macro.get("instrument_attn_ratio_avg"),
+            "mIoU_avg": macro.get("mIoU_avg"),
+            "n_instruments": macro.get("n_instruments"),
+        },
+    }
+
+
+def build_per_instrument_summary(
+    records: list[dict[str, Any]],
+    *,
+    primary_source: str,
+    method: str = SUMMARY_ATTENTION_METHOD,
+    samples_per_instrument: int | None = None,
+    eval_all: bool = False,
+) -> dict[str, Any] | None:
+    """Per-instrument means + overall micro/macro/final averages."""
+    if not records:
+        return None
+
+    all_ratios, all_mious = _metric_values_from_records(records)
+    micro = _avg_block(all_ratios, all_mious, n_samples=len(records))
+
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for rec in records:
+        key = str(rec.get("instrument_key") or "").strip()
+        if not key:
+            key = instrument_key_for_record(
+                str(rec.get("instrument") or ""),
+                rec.get("annotation") or rec,
+            )
+        grouped[key].append(rec)
+
+    instruments: dict[str, Any] = {}
+    ratio_macro: list[float] = []
+    miou_macro: list[float] = []
+
+    for key in sorted(grouped):
+        recs = grouped[key]
+        ratios = [
+            float(r["instrument_attn_ratio"])
+            for r in recs
+            if r.get("instrument_attn_ratio") is not None
+        ]
+        mious = [float(r["mIoU"]) for r in recs if r.get("mIoU") is not None]
+        ratio_avg = (sum(ratios) / len(ratios)) if ratios else None
+        miou_avg = (sum(mious) / len(mious)) if mious else None
+        block: dict[str, Any] = {
+            "n_samples": len(recs),
+            "instrument_attn_ratio_avg": (
+                round(ratio_avg, 6) if ratio_avg is not None else None
+            ),
+            "mIoU_avg": round(miou_avg, 6) if miou_avg is not None else None,
+            "instrument_attn_ratio_values": [round(v, 6) for v in ratios],
+            "mIoU_values": [round(v, 6) for v in mious],
+        }
+        if ratio_avg is not None:
+            ratio_macro.append(ratio_avg)
+        if miou_avg is not None:
+            miou_macro.append(miou_avg)
+        instruments[key] = block
+
+    macro = {
+        "n_instruments": len(instruments),
+        "n_records_with_bbox": len(all_ratios),
+        "instrument_attn_ratio_avg": (
+            round(sum(ratio_macro) / len(ratio_macro), 6) if ratio_macro else None
+        ),
+        "mIoU_avg": round(sum(miou_macro) / len(miou_macro), 6) if miou_macro else None,
+    }
+
+    return {
+        "primary_source": primary_source,
+        "method": method,
+        "attention_bbox_percentile": ATTENTION_BBOX_PERCENTILE,
+        "samples_per_instrument": samples_per_instrument,
+        "eval_all": bool(eval_all),
+        "instruments": instruments,
+        "macro": macro,
+        "overall": {
+            "micro": micro,
+            "macro": macro,
+            "final": micro,
+        },
+    }
+
+
+def print_per_instrument_summary(summary: dict[str, Any] | None) -> None:
+    if not summary:
+        return
+    overall = summary.get("overall") or {}
+    micro = overall.get("micro") or {}
+    macro = overall.get("macro") or summary.get("macro") or {}
+    final = overall.get("final") or micro
+    print(
+        f"[SUMMARY] FINAL (micro, all records) "
+        f"instrument_attn_ratio_avg={final.get('instrument_attn_ratio_avg')} "
+        f"mIoU_avg={final.get('mIoU_avg')} n={micro.get('n_samples')}",
+        file=sys.stderr,
+    )
+    print(
+        f"[SUMMARY] macro (mean of per-instrument avgs) "
+        f"instrument_attn_ratio_avg={macro.get('instrument_attn_ratio_avg')} "
+        f"mIoU_avg={macro.get('mIoU_avg')} "
+        f"n_instruments={macro.get('n_instruments')}",
+        file=sys.stderr,
+    )
+    for key, block in (summary.get("instruments") or {}).items():
+        print(
+            f"  {key}: n={block.get('n_samples')} "
+            f"inst_ratio_avg={block.get('instrument_attn_ratio_avg')} "
+            f"mIoU_avg={block.get('mIoU_avg')}",
+            file=sys.stderr,
+        )
 
 
 # ── Cross-attention maps ──────────────────────────────────────────────────────
@@ -526,9 +743,9 @@ def run_cross_attention_for_frame(
     bp: PatchFeatureBackbone,
     test_path: Path,
     test_label: str,
-    labels_dir: Path,
-    vid_name: str | None,
-    frame_idx: int | None,
+    labels_dir: Path | None = None,
+    vid_name: str | None = None,
+    frame_idx: int | None = None,
     query_index: dict[str, Path],
     query_from_gt_crop: bool,
     fuzzy_cutoff: float,
@@ -537,22 +754,25 @@ def run_cross_attention_for_frame(
     run_title: str,
     instrument_filter: str | None = None,
     query_encoding: str = "vision_ref",
+    annotations: list[dict[str, Any]] | None = None,
+    frame_labels: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     test_image = Image.open(test_path).convert("RGB")
-    frame_labels: set[str] = set()
-    annotations: list[dict[str, Any]] = []
+    resolved_labels: set[str] = set(frame_labels or ())
+    resolved_annotations: list[dict[str, Any]] = list(annotations or [])
 
-    if vid_name is not None and frame_idx is not None:
-        frame_labels = get_frame_labels(vid_name, frame_idx, labels_dir)
-        annotations = get_full_frame_annotations(vid_name, frame_idx, labels_dir)
-    elif instrument_filter:
-        annotations = [{"instrument": instrument_filter, "bbox_xyxy": None}]
-    elif query_index:
-        annotations = [{"instrument": p.stem, "bbox_xyxy": None} for p in query_index.values()]
-    else:
-        annotations = []
+    if not resolved_annotations:
+        if vid_name is not None and frame_idx is not None and labels_dir is not None:
+            resolved_labels = get_frame_labels(vid_name, frame_idx, labels_dir)
+            resolved_annotations = get_full_frame_annotations(vid_name, frame_idx, labels_dir)
+        elif instrument_filter:
+            resolved_annotations = [{"instrument": instrument_filter, "bbox_xyxy": None}]
+        elif query_index:
+            resolved_annotations = [
+                {"instrument": p.stem, "bbox_xyxy": None} for p in query_index.values()
+            ]
 
-    if vid_name is not None and frame_idx is not None and not annotations:
+    if vid_name is not None and frame_idx is not None and labels_dir is not None and not resolved_annotations:
         print(
             f"[WARN] No visible bbox annotations on {vid_name} frame {frame_idx}"
             + (f" (filtered: {instrument_filter})" if instrument_filter else ""),
@@ -562,7 +782,7 @@ def run_cross_attention_for_frame(
     seen_inst: set[str] = set()
     records: list[dict[str, Any]] = []
 
-    for ann in annotations:
+    for ann in resolved_annotations:
         inst = ann["instrument"]
         if inst in seen_inst:
             continue
@@ -599,7 +819,7 @@ def run_cross_attention_for_frame(
             test_label,
             all_maps,
             bp.source_labels,
-            frame_labels,
+            resolved_labels,
             alpha,
             bbox,
             ann if bbox else None,
@@ -620,13 +840,25 @@ def run_cross_attention_for_frame(
         if bbox is not None:
             for src in bp.source_names:
                 for method in METHODS:
-                    stats[src][method]["bbox"] = attention_bbox_stats(
+                    bbox_stats = attention_bbox_stats(
                         all_maps[src][method], bbox, bp.grid_h, bp.grid_w
                     )
+                    miou_v, pred_bbox = attention_bbox_miou(
+                        all_maps[src][method], bbox, bp.grid_h, bp.grid_w
+                    )
+                    bbox_stats["mIoU"] = round(miou_v, 6)
+                    if pred_bbox is not None:
+                        bbox_stats["pred_bbox_xyxy"] = [round(v, 6) for v in pred_bbox]
+                    stats[src][method]["bbox"] = bbox_stats
 
         primary = bp.source_names[0]
-        ratio = stats[primary]["patch_cross_max"].get("bbox", {}).get("instrument_attn_ratio", float("nan"))
-        print(f" done  {primary}_inst_ratio={ratio:.3f}", file=sys.stderr)
+        bbox_primary = stats[primary][SUMMARY_ATTENTION_METHOD].get("bbox", {})
+        ratio = bbox_primary.get("instrument_attn_ratio", float("nan"))
+        miou_v = bbox_primary.get("mIoU", float("nan"))
+        print(
+            f" done  {primary}_inst_ratio={ratio:.3f} mIoU={miou_v:.3f}",
+            file=sys.stderr,
+        )
 
         rec: dict[str, Any] = {
             "test_label": test_label,
@@ -634,10 +866,15 @@ def run_cross_attention_for_frame(
             "query": query_name,
             "query_encoding": query_encoding,
             "instrument": inst,
+            "instrument_key": instrument_key_for_record(inst, ann),
             "query_match_method": qmatch,
-            "matched_label": query_matches_frame_labels(query_name, frame_labels),
+            "matched_label": query_matches_frame_labels(query_name, resolved_labels),
             "stats": stats,
         }
+        if bbox is not None:
+            rec["instrument_attn_ratio"] = bbox_primary.get("instrument_attn_ratio")
+            rec["mIoU"] = bbox_primary.get("mIoU")
+            rec["pred_bbox_xyxy"] = bbox_primary.get("pred_bbox_xyxy")
         if vid_name:
             rec["video"] = vid_name
         if frame_idx is not None:
@@ -846,6 +1083,20 @@ def main() -> None:
             )
             all_records.extend(recs)
 
+    per_inst = None
+    overall_avg = None
+    if all_records:
+        per_inst = build_per_instrument_summary(
+            all_records,
+            primary_source=bp.source_names[0],
+            samples_per_instrument=(
+                None if args.eval_all else max(0, args.samples_per_instrument)
+            ),
+            eval_all=bool(args.eval_all),
+        )
+        overall_avg = overall_avg_from_summary(per_inst)
+        print_per_instrument_summary(per_inst)
+
     payload = {
         "task": "visual_cross_attention_cholect50",
         "backend": backend,
@@ -856,13 +1107,19 @@ def main() -> None:
         "dataset_root": str(args.dataset_root),
         "query_dir": str(query_dir),
         "query_from_gt_crop": bool(args.query_from_gt_crop),
+        "samples_per_instrument": args.samples_per_instrument,
+        "eval_all": bool(args.eval_all),
+        "seed": args.seed,
         "grid": f"{bp.grid_h}x{bp.grid_w}",
         "sources": bp.source_names,
         "source_labels": bp.source_labels,
         "methods": METHODS,
+        "summary_method": SUMMARY_ATTENTION_METHOD,
         "vision_meta": bp.meta,
         "visualization_dir": str(viz_dir),
         "n_records": len(all_records),
+        "per_instrument_summary": per_inst,
+        "overall_avg": overall_avg,
         "records": all_records,
     }
     out_json = out_dir / "cross_attention.json"

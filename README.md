@@ -1,6 +1,6 @@
 # surgical_vlm_test
 
-CholecT50 **triplet recognition** · CholecT50 **language grounding** (`surgical_prompts.json`) · CholecT50 **visual cross-attention** · Cholec80 **phase recognition** · SAR-RARP50 **action recognition** · EndoVis 2017 **instrument localization** · EndoVis 2018 VQA **tissue/instrument recognition** · Endoscapes **CVS evaluation** 벤치를 위한 독립 패키지입니다.  
+CholecT50 **triplet recognition** · CholecT50 **language grounding** (`surgical_prompts.json`) · SAR-RARP50 **language next-action planning** · CholecT50 **visual cross-attention** · Cholec80 **phase recognition** · SAR-RARP50 **action recognition** · EndoVis 2017 **instrument localization** · EndoVis 2018 VQA **tissue/instrument recognition** · Endoscapes **CVS evaluation** 벤치를 위한 독립 패키지입니다.  
 `surgical_vlm_grounding`과 분리되어 있으며, CholecT50/80·EndoVis 18 VQA는 분류·인식(MCQ) 중심이고 EndoVis 2017만 mask→bbox·시각화를 사용합니다.
 
 백엔드 (`backends.py` · `backend_registry.py` · `hf_model_loader.py`):
@@ -34,6 +34,7 @@ CholecT50 **triplet recognition** · CholecT50 **language grounding** (`surgical
 | `endovis18_vqa_data.py` | EndoVis 18 VQA Classification QA·보기·이미지 매핑 |
 | `cvs_evaluation_endoscapes.py` | Endoscapes CVS (yes/no × 3 criteria) |
 | `language_grounding_surgical_prompts.py` | CholecT50 `surgical_prompts.json` text-only triplet completion (F1 + macro AUROC/mAP) |
+| `language_grounding_sarrarp50_next_action.py` | SAR-RARP50 text-only next-action planning from `action_continuous` sequences |
 | `visual_cross_attention_cholect50.py` | CholecT50 query×test patch cross-attention heatmap·시각화 |
 | `patch_feature_extractors.py` | timm / prismatic / HF vision tower patch feature 추출 |
 | `cholect_query_match.py` | query 라벨 ↔ 프레임 GT instrument fuzzy match |
@@ -54,6 +55,7 @@ CholecT50 **triplet recognition** · CholecT50 **language grounding** (`surgical
 | `scripts/extract_cholec80_frames.sh` | Cholec80 0.1 fps 프레임 추출 → `../eval/cholec80/frames_0p1fps` |
 | `scripts/build_cholec80_eval_phase_annotations.py` | eval frame용 `videoNN-phase.txt` manifest 생성 |
 | `scripts/extract_sarrarp50_frames.py` | SAR-RARP50 segmentation 인덱스에서 PNG 추출 → `video_xx/frames/` |
+| `../eval/prompts/build_sarrarp50_next_action_prompts.py` | SAR-RARP50 language next-action prompt JSON 생성 |
 
 ---
 
@@ -160,6 +162,54 @@ python language_grounding_surgical_prompts.py --metrics-only \
 ```
 
 출력: `outputs/language_grounding_surgical_prompts/lang_<backend>_<model>/surgical_prompts.json`
+
+### SAR-RARP50 Language Next-Action Planning
+
+**Next action planning** — `action_continuous.txt` gesture sequence만으로 다음 needle/suture action을 예측합니다 (`language_grounding_sarrarp50_next_action.py`). **이미지·비디오 입력 없음.**
+
+- **데이터**: `../eval/prompts/sarrarp50_next_action/`
+  - `sarrarp50_next_action_prompts.json` — merge (10,050 rows, test videos 41–50)
+  - `video_XX.json` — 비디오별 prompt
+  - `metadata.json` — 통계
+- **빌드**: `../eval/prompts/build_sarrarp50_next_action_prompts.py` (SAR-RARP50 `eval/sarrarp50` 필요)
+- **수술/단계 문구**: `radical prostatectomy`, `suturing phase`
+- **Other (id 0)**: action history에서 **생략**, 정답이 Other인 prompt **제외**, MCQ 옵션에서도 **제외** (7-class)
+- **프롬프트**: past+current action sequence → next action 질문 + 7개 action option list + Other 생략 note
+- **변형**: 6 templates × history modes (`full`, last 3/5/8/12) per segment boundary
+- **지표**: action class id (1–7) **exact-match accuracy** (`by_video`, `by_history_mode`, `by_template_id`)
+
+**프롬프트 예**
+
+```
+During radical prostatectomy in the suturing phase, the surgical team has performed
+the following needle-and-suture actions in order: Picking-up the needle → Positioning the needle tip.
+What is the next action?
+
+Note: ambiguous "Other" actions are omitted from the action history and are not valid answer choices.
+
+The available action options are: Picking-up the needle, Positioning the needle tip, ...
+Answer with exactly one action from the options above only. ...
+```
+
+데이터 재생성:
+
+```bash
+python ../eval/prompts/build_sarrarp50_next_action_prompts.py
+```
+
+```bash
+BACKEND=qwen3-4b bash grounding_task.sh language_grounding_sarrarp50_next_action --limit 20
+BACKEND=qwen3-4b bash grounding_task.sh language_grounding_sarrarp50_next_action \
+  --filter-video video_41 --filter-history-mode full
+BACKEND=gpt MODEL_ID=gpt-4o-mini bash grounding_task.sh language_grounding_sarrarp50_next_action --limit 20
+
+python language_grounding_sarrarp50_next_action.py --metrics-only \
+  outputs/language_grounding_sarrarp50_next_action/lang_qwen3-4b_.../sarrarp50_next_action.json
+```
+
+출력: `outputs/language_grounding_sarrarp50_next_action/lang_<backend>_<model>/sarrarp50_next_action.json`
+
+> Vision SAR-RARP50 eval (`action_recognition_sarrarp50`)는 segmentation 프레임 + MCQ. 이 태스크는 **language-only** sequence planning입니다.
 
 ### Cholec80 Phase Recognition
 
@@ -409,6 +459,17 @@ bash grounding_task.sh visual_cross_attention_cholect50 \
 | `eval/prompts/build_surgical_prompt.py` | 런타임 NL 프롬프트 (`language_grounding_surgical_prompts.py`에서 import) |
 
 재생성: `cd ../eval/prompts && python3 surgical_prompts && python3 preprocess_surgical_prompts.py`
+
+**SAR-RARP50 (language next-action, text-only)**
+
+| 경로 | 역할 |
+|------|------|
+| `<surgical repo>/eval/sarrarp50` | `video_XX/action_continuous.txt` (gesture segments) |
+| `eval/prompts/build_sarrarp50_next_action_prompts.py` | prompt JSON 생성기 |
+| `eval/prompts/sarrarp50_next_action/sarrarp50_next_action_prompts.json` | merge (기본 `--dataset-json`) |
+| `eval/prompts/sarrarp50_next_action/video_XX.json` | 비디오별 prompt |
+
+재생성: `python ../eval/prompts/build_sarrarp50_next_action_prompts.py`
 
 **Cholec80 (phase)**
 
@@ -719,6 +780,7 @@ eval/sarrarp50/video_41/
 |--------|----------|------------------|
 | `triplet_recognition_cholect50` | `triplet_recognition_cholect50.py` | `--dataset-root` → `CHOLECT50_CHALLENGE_VAL_ROOT` |
 | `language_grounding_surgical_prompts` | `language_grounding_surgical_prompts.py` | `--dataset-json` → `SURGICAL_PROMPTS_JSON` |
+| `language_grounding_sarrarp50_next_action` | `language_grounding_sarrarp50_next_action.py` | `--dataset-json` → `SARRARP50_NEXT_ACTION_PROMPTS_JSON` |
 | `phase_recognition_cholec80` | `phase_recognition_cholec80.py` | `CHOLEC80_ROOT`, `CHOLEC80_FRAMES_ROOT`, `--split eval` |
 | `instrument_localization_endovis17` | `instrument_localization_endovis17.py` | `--dataset-root` → `ENDOVIS2017_ROOT` |
 | `tissue_instrument_recognition_endovis18` | `tissue_instrument_recognition_endovis18.py` | `ENDOVIS18_VQA_ROOT`, `ENDOVIS2018_IMAGES_ROOT` |
@@ -733,7 +795,7 @@ eval/sarrarp50/video_41/
 | 스크립트 | 용도 (현재 활성 예) |
 |----------|---------------------|
 | `sequential_1.sh` | `phase_recognition_cholec80` — paligemma2, qwen3-4b, qwen3-32b |
-| `sequential_2.sh` | `language_grounding_surgical_prompts` — cosmos/internvl/paligemma/qwen + SurgSigma LoRA |
+| `sequential_2.sh` | `language_grounding_surgical_prompts` · `language_grounding_sarrarp50_next_action` — cosmos/internvl/paligemma/qwen + SurgSigma LoRA |
 | `sequential_3.sh` | localization·triplet 등 혼합 (대부분 주석 템플릿) |
 
 ```bash
@@ -901,6 +963,46 @@ python language_grounding_surgical_prompts.py --metrics-only \
 ```
 
 결과 JSON (기본): `outputs/language_grounding_surgical_prompts/lang_<backend>_<model>/surgical_prompts.json`
+
+#### SAR-RARP50 language next-action
+
+`grounding_task.sh` 기본 주입:
+
+- `--dataset-json` → `$SARRARP50_NEXT_ACTION_PROMPTS_JSON` (`../eval/prompts/sarrarp50_next_action/sarrarp50_next_action_prompts.json`)
+
+**Prompt 빌드 (최초 1회 또는 sequence 정책 변경 시)**
+
+```bash
+python ../eval/prompts/build_sarrarp50_next_action_prompts.py
+```
+
+**로컬 HF / Prismatic** (text-only):
+
+```bash
+BACKEND=qwen3-4b DEVICE_VISIBLE=0 \
+  bash grounding_task.sh language_grounding_sarrarp50_next_action --limit 20
+
+BACKEND=qwen3-4b bash grounding_task.sh language_grounding_sarrarp50_next_action \
+  --filter-video video_41 --filter-history-mode full --filter-template-id 0
+
+BACKEND=prismatic bash grounding_task.sh language_grounding_sarrarp50_next_action --limit 50
+```
+
+**Cloud text API**
+
+```bash
+BACKEND=gpt MODEL_ID=gpt-4o-mini \
+  bash grounding_task.sh language_grounding_sarrarp50_next_action --limit 20
+```
+
+**메트릭만 재계산**
+
+```bash
+python language_grounding_sarrarp50_next_action.py --metrics-only \
+  outputs/language_grounding_sarrarp50_next_action/lang_qwen3-4b_qwen3-vl-4b/sarrarp50_next_action.json
+```
+
+결과 JSON (기본): `outputs/language_grounding_sarrarp50_next_action/lang_<backend>_<model>/sarrarp50_next_action.json`
 
 #### Cholec80 phase
 
@@ -1223,6 +1325,18 @@ uv run --python /path/to/hf-env/bin/python \
   --prompt-mode mcq
 ```
 
+**SAR-RARP50 language next-action** (text-only):
+
+```bash
+python ../eval/prompts/build_sarrarp50_next_action_prompts.py
+
+uv run --python /path/to/hf-env/bin/python \
+  language_grounding_sarrarp50_next_action.py \
+  --backend qwen3-4b \
+  --dataset-json ../eval/prompts/sarrarp50_next_action/sarrarp50_next_action_prompts.json \
+  --limit 20
+```
+
 **CholecT50 language grounding** (text-only, GPU 또는 API):
 
 ```bash
@@ -1367,6 +1481,21 @@ VLM `generate()` 미사용. `--feature-backbone hf`일 때만 `--backend` / `--m
 
 이미지·비디오 입력 없음. 로컬 HF/prismatic은 `generate_text()`; API는 text endpoint.
 
+**SAR-RARP50 language next-action (`language_grounding_sarrarp50_next_action.py`)**
+
+| 인자 | 설명 |
+|------|------|
+| `--dataset-json` | merge prompt JSON (기본: `../eval/prompts/sarrarp50_next_action/sarrarp50_next_action_prompts.json`) |
+| `--limit N` | 최대 N개 샘플 |
+| `--filter-video` | `video_41` 등 |
+| `--filter-history-mode` | `full`, `3`, `5`, `8`, `12` |
+| `--filter-template-id` | 0–5 (paraphrase template) |
+| `--max-new-tokens` | 생성 토큰 상한 (기본 32) |
+| `--metrics-only PATH` | 기존 결과 JSON에서 accuracy만 재계산 |
+| `--output` / `--output-root` | 결과 경로 override |
+
+이미지·비디오 없음. GT는 action id 1–7 only (Other 제외).
+
 **Endoscapes CVS (`cvs_evaluation_endoscapes.py`)**
 
 | 인자 | 설명 |
@@ -1404,7 +1533,8 @@ VLM `generate()` 미사용. `--feature-backbone hf`일 때만 `--backend` / `--m
 | EndoVis 2018 VQA | `outputs/tissue_instrument_recognition_endovis18/tir_{backend}_{model}_mcq_{split}/` | `endovis18_tir_{split}.json` (`split` = `val` / `train` / `both`) |
 | Endoscapes CVS | `outputs/cvs_evaluation_endoscapes/cvs_{backend}_{model}_{protocol}_{split}/` | `endoscapes_cvs_{split}.json` |
 | SAR-RARP50 action | `outputs/action_recognition_sarrarp50/action_{backend}_{model}_{prompt_mode}/` | `sarrarp50_action_seg1hz.json` |
-| Language grounding | `outputs/language_grounding_surgical_prompts/lang_{backend}_{model}/` | `surgical_prompts.json` |
+| Language grounding (Cholec) | `outputs/language_grounding_surgical_prompts/lang_{backend}_{model}/` | `surgical_prompts.json` |
+| Language next-action (SAR-RARP50) | `outputs/language_grounding_sarrarp50_next_action/lang_{backend}_{model}/` | `sarrarp50_next_action.json` |
 | Visual cross-attention | `outputs/visual_cross_attention_cholect50/{model_name}/` | `cross_attention.json` (+ `viz/*.png`) |
 
 **예시 (visual cross-attention, HF Qwen3-VL 32B):**
@@ -1506,6 +1636,7 @@ JSON 필드 요약:
 | `ENDOSCAPES_ROOT` | CVS `--dataset-root` (기본: `../eval/endoscapes`) |
 | `SARRARP50_ROOT` | action recognition `--dataset-root` (기본: `../eval/sarrarp50`) |
 | `SURGICAL_PROMPTS_JSON` | language grounding `--dataset-json` (기본: `../eval/prompts/surgical_prompts.json`) |
+| `SARRARP50_NEXT_ACTION_PROMPTS_JSON` | SAR-RARP50 next-action `--dataset-json` (기본: `../eval/prompts/sarrarp50_next_action/sarrarp50_next_action_prompts.json`) |
 | `PRISMATIC_PYTHON` | prismatic venv python override |
 | `GROUNDING_TASK_AUTO_BACKEND_SETUP` | `0`이면 prismatic uv 자동 설치 스킵 |
 
@@ -1518,7 +1649,7 @@ JSON 필드 요약:
 | 목적 | CholecT50 triplet·language · Cholec80 phase · EndoVis 2017 bbox · EndoVis 18 VQA MCQ · SAR-RARP50 action | Localization, legacy visual grounding 등 |
 | CholecT50 | `triplet_recognition_cholect50.py`, `language_grounding_surgical_prompts.py` | `localization_cholect50.py`, legacy `language_grounding_v*`, … |
 | Cholec80 | `phase_recognition_cholec80.py` | (별도 phase 스크립트 없음) |
-| SAR-RARP50 | `action_recognition_sarrarp50.py` | segmentation-indexed frames + `action_discrete.txt` |
+| SAR-RARP50 | `action_recognition_sarrarp50.py`, `language_grounding_sarrarp50_next_action.py` | vision MCQ vs text-only next-action from `action_continuous` |
 | EndoVis 2017 | `instrument_localization_endovis17.py` | mask segmentation (별도) |
 | EndoVis 2018 VQA | `tissue_instrument_recognition_endovis18.py` | — |
 | Bbox | EndoVis 2017 mask→bbox + viz | CholecT50 localization 등 |
@@ -1568,6 +1699,7 @@ JSON 필드 요약:
 21. **cross-attention 프레임 없음** — `CHOLECT50_VIDEOS_ROOT` 또는 `--videos-root` 확인; `{vid}/{frame:06d}.png` 경로
 22. **cross-attention query 없음** — `assets/cholect50_query/`에 PNG 추가 또는 `--query-from-gt-crop` 사용
 23. **cross-attention timm** — `pip install timm` in `HF_PYTHON` env; `--feature-backbone hf`는 `--backend`에 맞는 transformers·PEFT 필요
+24. **`sarrarp50_next_action_prompts.json` 없음** — `python ../eval/prompts/build_sarrarp50_next_action_prompts.py` (needs `eval/sarrarp50/video_XX/action_continuous.txt`)
 
 ```bash
 python triplet_recognition_cholect50.py --help
@@ -1578,5 +1710,6 @@ python scripts/extract_sarrarp50_frames.py --help
 python instrument_localization_endovis17.py --help
 python tissue_instrument_recognition_endovis18.py --help
 python cvs_evaluation_endoscapes.py --help
+python language_grounding_sarrarp50_next_action.py --help
 bash grounding_task.sh help
 ```

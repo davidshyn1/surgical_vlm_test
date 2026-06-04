@@ -23,11 +23,13 @@ export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_CACHE_ROOT/transformers}"
 : "${CHOLEC80_EVAL_ROOT:=$ROOT/../eval/cholec80}"
 : "${CHOLEC80_FRAMES_ROOT:=$CHOLEC80_EVAL_ROOT/frames_0p1fps}"
 : "${ENDOVIS2017_ROOT:=$ROOT/../eval/endovis2017}"
+: "${ENDOVIS2017_QUERY_DIR:=$ROOT/assets/endovis2017_query}"
 : "${ENDOVIS18_VQA_ROOT:=$ROOT/../eval/EndoVis-18-VQA}"
 : "${ENDOVIS2018_IMAGES_ROOT:=$ROOT/../eval/endovis2018}"
 : "${ENDOSCAPES_ROOT:=$ROOT/../eval/endoscapes}"
 : "${SARRARP50_ROOT:=$ROOT/../eval/sarrarp50}"
 : "${SURGICAL_PROMPTS_JSON:=$ROOT/../eval/prompts/surgical_prompts.json}"
+: "${SARRARP50_NEXT_ACTION_PROMPTS_JSON:=$ROOT/../eval/prompts/sarrarp50_next_action/sarrarp50_next_action_prompts.json}"
 
 guess_conda_python() {
   local env_name="$1"
@@ -149,10 +151,16 @@ Usage:
   BACKEND=<backend> bash grounding_task.sh tissue_instrument_recognition_endovis18 [args...]
   BACKEND=<backend> bash grounding_task.sh cvs_evaluation_endoscapes [args...]
   BACKEND=<backend> bash grounding_task.sh language_grounding_surgical_prompts [args...]
+  BACKEND=<backend> bash grounding_task.sh language_grounding_sarrarp50_next_action [args...]
   bash grounding_task.sh visual_cross_attention_cholect50 --video VID68 --frame 837 --query-from-gt-crop
+  BACKEND=qwen3-4b bash grounding_task.sh visual_cross_attention_endovis2017 \\
+    --feature-backbone hf --query-from-gt-crop --samples-per-instrument 3
 
 Language grounding uses text-only inference (no image). Compatible backends:
   prismatic, hf, qwen3-*, cosmos-*, internvl3.5, paligemma2, groot, openai, gemini, claude
+
+  language_grounding_surgical_prompts     CholecT50 triplet completion (surgical_prompts.json)
+  language_grounding_sarrarp50_next_action  SAR-RARP50 next-action planning (text-only, no image)
 
 Backends:
   prismatic     TRI-ML prismatic-vlms (local backend package / checkpoint)
@@ -178,6 +186,11 @@ Examples:
   BACKEND=qwen3-4b bash grounding_task.sh language_grounding_surgical_prompts --filter-subtype pit_to_verb
   BACKEND=gpt MODEL_ID=gpt-4o-mini bash grounding_task.sh language_grounding_surgical_prompts --limit 20
 
+  # SAR-RARP50 next-action (build prompts first: eval/prompts/build_sarrarp50_next_action_prompts.py)
+  BACKEND=qwen3-4b bash grounding_task.sh language_grounding_sarrarp50_next_action --limit 20
+  BACKEND=qwen3-4b bash grounding_task.sh language_grounding_sarrarp50_next_action \\
+    --filter-video video_41 --filter-history-mode full --filter-template-id 0
+
 Env:
   HF_PYTHON                     Python for local HF backends (default: conda surgical)
   API_PYTHON                    Python for openai/gemini/claude (default: same as HF_PYTHON)
@@ -186,6 +199,7 @@ Env:
   MODEL_NAME                    default --model-name (output folder slug) when omitted
   GROUNDING_TASK_AUTO_BACKEND_SETUP=0  skip auto uv install (prismatic only)
   SURGICAL_PROMPTS_JSON              default --dataset-json for language_grounding_surgical_prompts
+  SARRARP50_NEXT_ACTION_PROMPTS_JSON default --dataset-json for language_grounding_sarrarp50_next_action
 EOF
 }
 
@@ -205,7 +219,9 @@ case "$task" in
   cvs_evaluation_endoscapes) script="cvs_evaluation_endoscapes.py" ;;
   action_recognition_sarrarp50) script="action_recognition_sarrarp50.py" ;;
   language_grounding_surgical_prompts) script="language_grounding_surgical_prompts.py" ;;
+  language_grounding_sarrarp50_next_action) script="language_grounding_sarrarp50_next_action.py" ;;
   visual_cross_attention_cholect50) script="visual_cross_attention_cholect50.py" ;;
+  visual_cross_attention_endovis2017) script="visual_cross_attention_endovis2017.py" ;;
   -h|--help|help) usage; exit 0 ;;
   *)
     echo "ERROR: unknown task '$task'" >&2
@@ -254,8 +270,12 @@ if [[ "$task" == "phase_recognition_cholec80" ]]; then
   [[ -n "$CHOLEC80_FRAMES_ROOT" ]] && ! has_flag "--frames-root" "$@" && set -- "$@" --frames-root "$CHOLEC80_FRAMES_ROOT"
 fi
 
-if [[ "$task" == "instrument_localization_endovis17" ]]; then
+if [[ "$task" == "instrument_localization_endovis17" || "$task" == "visual_cross_attention_endovis2017" ]]; then
   ! has_flag "--dataset-root" "$@" && set -- "$@" --dataset-root "$ENDOVIS2017_ROOT"
+fi
+
+if [[ "$task" == "visual_cross_attention_endovis2017" ]]; then
+  ! has_flag "--query-dir" "$@" && set -- "$@" --query-dir "$ENDOVIS2017_QUERY_DIR"
 fi
 
 if [[ "$task" == "tissue_instrument_recognition_endovis18" ]]; then
@@ -273,6 +293,10 @@ fi
 
 if [[ "$task" == "language_grounding_surgical_prompts" ]]; then
   ! has_flag "--dataset-json" "$@" && set -- "$@" --dataset-json "$SURGICAL_PROMPTS_JSON"
+fi
+
+if [[ "$task" == "language_grounding_sarrarp50_next_action" ]]; then
+  ! has_flag "--dataset-json" "$@" && set -- "$@" --dataset-json "$SARRARP50_NEXT_ACTION_PROMPTS_JSON"
 fi
 
 exec uv run --python "$python_bin" "$script" "$@"

@@ -1,25 +1,85 @@
-# BACKEND=gemini MODEL_ID=gemini-2.0-flash API_WORKERS=16  bash grounding_task.sh triplet_recognition_cholect50 --eval-protocol joint --prompt-mode mcq --eval-all --max-new-tokens 32
-# BACKEND=qwen3-4b DEVICE_VISIBLE=2 MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full   bash grounding_task.sh triplet_recognition_cholect50 --eval-protocol sequential_gt --prompt-mode mcq --eval-all --max-new-tokens 32
-# BACKEND=qwen3-4b DEVICE_VISIBLE=2 MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full   bash grounding_task.sh instrument_localization_endovis17 --viz
-# BACKEND=qwen3-4b DEVICE_VISIBLE=2 MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full   bash grounding_task.sh phase_recognition_cholec80
-# BACKEND=qwen3-4b DEVICE_VISIBLE=2 MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full   bash grounding_task.sh tissue_instrument_recognition_endovis18
-# BACKEND=qwen3-4b DEVICE_VISIBLE=2 MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full   bash grounding_task.sh cvs_evaluation_endoscapes
 
 
-# BACKEND=cosmos-32b DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --instrument-taxonomy cholect50 --viz 
-# BACKEND=internvl3.5 DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --instrument-taxonomy cholect50 --viz
-# BACKEND=paligemma2 DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --instrument-taxonomy cholect50 --viz
-# BACKEND=qwen2.5 DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --instrument-taxonomy cholect50 --viz
-# BACKEND=qwen3-4b DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --instrument-taxonomy cholect50 --viz
-# BACKEND=qwen3-32b DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --instrument-taxonomy cholect50 --viz
-# BACKEND=cosmos-2b DEVICE_VISIBLE=2 bash grounding_task.sh   instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --instrument-taxonomy cholect50 --viz
-BACKEND=qwen3-4b DEVICE_VISIBLE=2 MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full   bash grounding_task.sh instrument_localization_endovis17 --min-component-pixels 50 --bbox-mode filtered_union --viz
+BACKEND=cosmos-32b DEVICE_VISIBLE=3 \
+  bash grounding_task.sh visual_cross_attention_endovis2017 \
+--feature-backbone hf \
+--query-from-gt-crop \
+--dataset-root /NHNHOME/WORKSPACE/26msit001_T_B/KAIST-AIPRLab/surgical/eval/endovis2017 \
+--eval-all
 
-BACKEND=qwen3-4b DEVICE_VISIBLE=2 \
-  MODEL_ID=khtks/Qwen3-VL/surgsigma_qwen3vl_full \
-  bash grounding_task.sh instrument_localization_endovis17 \
-  --prompt-format pixel_compact \
-  --min-component-pixels 50 \
-  --bbox-mode filtered_union \
-  --max-samples 50 \
-  --viz
+BACKEND=internvl3.5 DEVICE_VISIBLE=3 \
+  bash grounding_task.sh visual_cross_attention_endovis2017  \
+--feature-backbone hf \
+--query-from-gt-crop \
+--dataset-root /NHNHOME/WORKSPACE/26msit001_T_B/KAIST-AIPRLab/surgical/eval/endovis2017 \
+--eval-all
+
+BACKEND=paligemma2 DEVICE_VISIBLE=3 \
+  bash grounding_task.sh visual_cross_attention_endovis2017  \
+--feature-backbone hf \
+--query-from-gt-crop \
+--dataset-root /NHNHOME/WORKSPACE/26msit001_T_B/KAIST-AIPRLab/surgical/eval/endovis2017 \
+--eval-all
+
+BACKEND=qwen3-4b DEVICE_VISIBLE=3 \
+  bash grounding_task.sh visual_cross_attention_endovis2017  \
+--feature-backbone hf \
+--query-from-gt-crop \
+--dataset-root /NHNHOME/WORKSPACE/26msit001_T_B/KAIST-AIPRLab/surgical/eval/endovis2017 \
+--eval-all
+
+BACKEND=qwen3-32b DEVICE_VISIBLE=3 \
+  bash grounding_task.sh visual_cross_attention_endovis2017  \
+--feature-backbone hf \
+--query-from-gt-crop \
+--dataset-root /NHNHOME/WORKSPACE/26msit001_T_B/KAIST-AIPRLab/surgical/eval/endovis2017 \
+--eval-all
+
+BACKEND=qwen3-32b DEVICE_VISIBLE=3 MODEL_ID=SurgVLA-Foundry/Qwen3-VL/qwen3vl-32b-surgsigma-lora-ft-v1 \
+  bash grounding_task.sh visual_cross_attention_endovis2017  \
+--feature-backbone hf \
+--query-from-gt-crop \
+--dataset-root /NHNHOME/WORKSPACE/26msit001_T_B/KAIST-AIPRLab/surgical/eval/endovis2017 \
+--eval-all
+
+BACKEND=qwen3-32b DEVICE_VISIBLE=3 MODEL_ID=SurgVLA-Foundry/Qwen3-VL/qwen3vl-32b-augmented-lora-ft-v0.1/checkpoint-53000 \
+  bash grounding_task.sh visual_cross_attention_endovis2017  \
+--feature-backbone hf \
+--query-from-gt-crop \
+--dataset-root /NHNHOME/WORKSPACE/26msit001_T_B/KAIST-AIPRLab/surgical/eval/endovis2017 \
+--eval-all
+
+BACKEND=qwen3-4b DEVICE_VISIBLE=3 MODEL_ID=SurgVLA-Foundry/Qwen3-VL/qwen3vl-4b-surgsigma-lora-ft-v1 \
+  bash grounding_task.sh visual_cross_attention_endovis2017  \
+--feature-backbone hf \
+--query-from-gt-crop \
+--dataset-root /NHNHOME/WORKSPACE/26msit001_T_B/KAIST-AIPRLab/surgical/eval/endovis2017 \
+--eval-all
+
+BACKEND=qwen3-4b DEVICE_VISIBLE=3 MODEL_ID=SurgVLA-Foundry/Qwen3-VL/qwen3vl-4b-augmented-lora-ft-v1 \
+  bash grounding_task.sh visual_cross_attention_endovis2017  \
+--feature-backbone hf \
+--query-from-gt-crop \
+--dataset-root /NHNHOME/WORKSPACE/26msit001_T_B/KAIST-AIPRLab/surgical/eval/endovis2017 \
+--eval-all
+
+BACKEND=qwen3-4b DEVICE_VISIBLE=3 MODEL_ID=SurgVLA-Foundry/Qwen3-VL/qwen3vl-4b-pretrained-dense-vision-lora-ft-v1 \
+  bash grounding_task.sh visual_cross_attention_endovis2017  \
+--feature-backbone hf \
+--query-from-gt-crop \
+--dataset-root /NHNHOME/WORKSPACE/26msit001_T_B/KAIST-AIPRLab/surgical/eval/endovis2017 \
+--eval-all
+
+BACKEND=qwen3-4b DEVICE_VISIBLE=3 MODEL_ID=SurgVLA-Foundry/Qwen3-VL/qwen3vl-4b-surgsigma-dense-vision-lora-ft-v1 \
+  bash grounding_task.sh visual_cross_attention_endovis2017  \
+--feature-backbone hf \
+--query-from-gt-crop \
+--dataset-root /NHNHOME/WORKSPACE/26msit001_T_B/KAIST-AIPRLab/surgical/eval/endovis2017 \
+--eval-all
+
+BACKEND=qwen3-4b DEVICE_VISIBLE=3 MODEL_ID=SurgVLA-Foundry/Qwen3-VL/qwen3vl-4b-augmented-dense-vision-lora-ft-v1 \
+  bash grounding_task.sh visual_cross_attention_endovis2017  \
+--feature-backbone hf \
+--query-from-gt-crop \
+--dataset-root /NHNHOME/WORKSPACE/26msit001_T_B/KAIST-AIPRLab/surgical/eval/endovis2017 \
+--eval-all
