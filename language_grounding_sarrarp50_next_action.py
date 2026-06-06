@@ -58,6 +58,7 @@ OTHER_ACTION_ID = 0
 ACTION_OPTIONS: list[str] = [
     ACTION_DISPLAY_NAMES[i] for i in sorted(ACTION_DISPLAY_NAMES) if i != OTHER_ACTION_ID
 ]
+ACTION_CANONICAL_IDS: list[str] = [f"a{i}" for i in sorted(ACTION_DISPLAY_NAMES) if i != OTHER_ACTION_ID]
 
 
 def _normalize_display_key(text: str) -> str:
@@ -249,6 +250,78 @@ def load_prompt_rows(
     return rows
 
 
+def _scored_evaluations(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    evs: list[dict[str, Any]] = []
+    for rec in results:
+        if rec.get("error"):
+            continue
+        ev = rec.get("evaluation")
+        if not isinstance(ev, dict):
+            continue
+        gold_canonical = ev.get("gold_canonical")
+        if not gold_canonical or gold_canonical == f"a{OTHER_ACTION_ID}":
+            continue
+        evs.append(ev)
+    return evs
+
+
+def compute_classification_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
+    evs = _scored_evaluations(results)
+    if not evs:
+        return {
+            "n_scored": 0,
+            "macro_recall": None,
+            "macro_precision": None,
+            "per_class": {},
+        }
+
+    y_true = [str(e["gold_canonical"]) for e in evs]
+    y_pred = [str(e.get("pred_canonical") or "__none__") for e in evs]
+    n = len(evs)
+    correct = sum(1 for e in evs if e.get("correct"))
+
+    per_class: dict[str, dict[str, Any]] = {}
+    recalls: list[float] = []
+    precisions: list[float] = []
+
+    for cid in ACTION_CANONICAL_IDS:
+        tp = sum(1 for t, p in zip(y_true, y_pred) if t == cid and p == cid)
+        fp = sum(1 for t, p in zip(y_true, y_pred) if t != cid and p == cid)
+        fn = sum(1 for t, p in zip(y_true, y_pred) if t == cid and p != cid)
+        support = sum(1 for t in y_true if t == cid)
+
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+
+        per_class[cid] = {
+            "display_name": CANONICAL_TO_DISPLAY.get(cid, cid),
+            "support": support,
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+            "precision": prec,
+            "recall": rec,
+        }
+        if support > 0:
+            recalls.append(rec)
+            precisions.append(prec)
+
+    def _macro(vals: list[float]) -> float | None:
+        return sum(vals) / len(vals) if vals else None
+
+    return {
+        "n_scored": n,
+        "accuracy": {
+            "correct": correct,
+            "total": n,
+            "value": (correct / n) if n else None,
+        },
+        "macro_recall": _macro(recalls),
+        "macro_precision": _macro(precisions),
+        "per_class": per_class,
+    }
+
+
 def aggregate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
     def _acc(items: list[dict[str, Any]], key: str) -> float | None:
         scored = [r for r in items if isinstance(r.get("evaluation"), dict)]
@@ -268,10 +341,13 @@ def aggregate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
         by_template[str(inp.get("template_id") or "unknown")].append(rec)
 
     def _block(items: list[dict[str, Any]]) -> dict[str, Any]:
+        cls = compute_classification_metrics(items)
         return {
             "count": len(items),
             "accuracy_id": _acc(items, "correct"),
             "accuracy_display": _acc(items, "exact_match_display"),
+            "macro_recall": cls.get("macro_recall"),
+            "macro_precision": cls.get("macro_precision"),
         }
 
     return {
@@ -304,10 +380,22 @@ def recompute_metrics_from_results(payload: dict[str, Any], option_map: dict[str
             n_correct += 1
         n_scored += 1
 
+    classification = compute_classification_metrics(results)
     payload["counts"] = {
         **(payload.get("counts") or {}),
         "rows_scored": n_scored,
+        "rows_correct": n_correct,
         "accuracy": (n_correct / n_scored) if n_scored else 0.0,
+    }
+    payload["metrics"] = {
+        **(payload.get("metrics") or {}),
+        "protocol": "sarrarp50_next_action_language_grounding",
+        "accuracy_note": "exact match on action class id (1–7; Other excluded)",
+        "n_scored": classification["n_scored"],
+        "accuracy": classification["accuracy"],
+        "macro_recall": classification["macro_recall"],
+        "macro_precision": classification["macro_precision"],
+        "per_class": classification["per_class"],
     }
     payload["breakdown"] = aggregate_metrics(results)
     return payload
@@ -378,7 +466,13 @@ def main() -> None:
         with mp.open("w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         acc = (payload.get("counts") or {}).get("accuracy")
-        print(f"Updated metrics in {mp}  accuracy={acc}", file=sys.stderr)
+        metrics = payload.get("metrics") or {}
+        print(
+            f"Updated metrics in {mp}  accuracy={acc}  "
+            f"macro_recall={metrics.get('macro_recall')}  "
+            f"macro_precision={metrics.get('macro_precision')}",
+            file=sys.stderr,
+        )
         return
 
     rows = load_prompt_rows(
@@ -486,6 +580,7 @@ def main() -> None:
 
     accuracy = (n_correct / n_scored) if n_scored else 0.0
     breakdown = aggregate_metrics(results)
+    classification = compute_classification_metrics(results)
 
     payload = {
         "task": "language_grounding_sarrarp50_next_action",
@@ -512,7 +607,13 @@ def main() -> None:
             "max_new_tokens": args.max_new_tokens,
         },
         "metrics": {
-            "accuracy": "exact match on action class id (1–7; Other excluded)",
+            "protocol": "sarrarp50_next_action_language_grounding",
+            "accuracy_note": "exact match on action class id (1–7; Other excluded)",
+            "n_scored": classification["n_scored"],
+            "accuracy": classification["accuracy"],
+            "macro_recall": classification["macro_recall"],
+            "macro_precision": classification["macro_precision"],
+            "per_class": classification["per_class"],
             "action_vocabulary": ACTION_OPTIONS,
             "label_vocabulary_normalized": label_vocab,
         },
@@ -533,7 +634,9 @@ def main() -> None:
 
     print(
         f"\nWrote {out_path}\n"
-        f"  accuracy={accuracy:.4f}  ({n_correct}/{n_scored})",
+        f"  accuracy={accuracy:.4f}  ({n_correct}/{n_scored})\n"
+        f"  macro_recall={classification.get('macro_recall')}  "
+        f"macro_precision={classification.get('macro_precision')}",
         file=sys.stderr,
     )
 

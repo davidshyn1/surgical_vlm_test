@@ -387,7 +387,7 @@ def _average_precision_from_scores(
 ) -> float:
     if not y_true:
         return 0.0
-    pairs = sorted(zip(y_score, y_true), key=lambda x: (-x[0], -x[1]))
+    pairs = sorted(zip(y_score, y_true), key=lambda x: -x[0])
     tp = fp = 0
     precisions: list[float] = []
     n_pos = sum(y_true)
@@ -791,7 +791,11 @@ def average_precision_binary(
     no_positive_fallback: float = 0.0,
     all_positive_fallback: float = 1.0,
 ) -> float:
-    """Average precision for binary labels (score-sorted)."""
+    """Average precision for binary labels (score-sorted).
+
+    Ties on ``y_score`` keep input order (stable sort). Positives are not
+    ranked above negatives when scores are equal.
+    """
     if not y_true:
         return no_positive_fallback
     n_pos = sum(y_true)
@@ -800,7 +804,7 @@ def average_precision_binary(
     if n_pos == len(y_true):
         return all_positive_fallback
 
-    pairs = sorted(zip(y_score, y_true), key=lambda x: (-x[0], -x[1]))
+    pairs = sorted(zip(y_score, y_true), key=lambda x: -x[0])
     tp = 0
     fp = 0
     precisions: list[float] = []

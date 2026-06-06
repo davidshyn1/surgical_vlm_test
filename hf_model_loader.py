@@ -195,6 +195,25 @@ def _hf_download_file(
         return None
 
 
+def _peft_adapter_subfolder_candidates(subfolder: str | None) -> list[str | None]:
+    """Hub-relative subfolders to probe for ``adapter_config.json``."""
+    if subfolder is None:
+        return [None]
+    if subfolder.endswith("qwen_lora"):
+        return [subfolder]
+    return [subfolder, f"{subfolder}/qwen_lora"]
+
+
+def _peft_hub_subfolder_for_adapter(model_id: str, adapter_dir: Path) -> str | None:
+    """Hub subfolder prefix for PEFT weight files under *adapter_dir*."""
+    _, subfolder = _split_hub_model_id(model_id)
+    if subfolder is None:
+        return None
+    if adapter_dir.name == "qwen_lora" and not subfolder.endswith("qwen_lora"):
+        return f"{subfolder}/qwen_lora"
+    return subfolder
+
+
 def resolve_peft_adapter_dir(
     model_id: str,
     *,
@@ -204,43 +223,51 @@ def resolve_peft_adapter_dir(
     """
     Return a local directory containing ``adapter_config.json``, or None.
     Supports a local path or Hub ids like ``khtks/Qwen3-VL/surgsigma_qwen3vl_full``.
+    Dense-vision bundles may store the LoRA under ``<bundle>/qwen_lora/``.
     """
     local = Path(model_id).expanduser()
-    if local.is_dir() and (local / "adapter_config.json").is_file():
-        return local.resolve()
+    if local.is_dir():
+        if (local / "adapter_config.json").is_file():
+            return local.resolve()
+        qwen_lora = local / "qwen_lora"
+        if (qwen_lora / "adapter_config.json").is_file():
+            return qwen_lora.resolve()
 
     repo_id, subfolder = _split_hub_model_id(model_id)
 
-    if subfolder is not None:
-        try:
-            from huggingface_hub import snapshot_download
-        except ImportError:
-            pass
-        else:
+    for candidate in _peft_adapter_subfolder_candidates(subfolder):
+        if candidate is not None:
             try:
-                root = snapshot_download(
-                    repo_id=repo_id,
-                    allow_patterns=[f"{subfolder}/*"],
-                    cache_dir=cache_dir,
-                    token=token,
-                )
-                adapter_dir = Path(root) / subfolder
-                if (adapter_dir / "adapter_config.json").is_file():
-                    return adapter_dir.resolve()
-            except Exception:
+                from huggingface_hub import snapshot_download
+            except ImportError:
                 pass
+            else:
+                try:
+                    root = snapshot_download(
+                        repo_id=repo_id,
+                        allow_patterns=[f"{candidate}/*"],
+                        cache_dir=cache_dir,
+                        token=token,
+                    )
+                    adapter_dir = Path(root) / candidate
+                    if (adapter_dir / "adapter_config.json").is_file():
+                        return adapter_dir.resolve()
+                except Exception:
+                    pass
 
-    rel_cfg = (
-        f"{subfolder}/adapter_config.json" if subfolder else "adapter_config.json"
-    )
-    cfg_path = _hf_download_file(
-        repo_id,
-        rel_cfg,
-        cache_dir=cache_dir,
-        token=token,
-    )
-    if cfg_path is not None and cfg_path.is_file():
-        return cfg_path.parent.resolve()
+        rel_cfg = (
+            f"{candidate}/adapter_config.json"
+            if candidate
+            else "adapter_config.json"
+        )
+        cfg_path = _hf_download_file(
+            repo_id,
+            rel_cfg,
+            cache_dir=cache_dir,
+            token=token,
+        )
+        if cfg_path is not None and cfg_path.is_file():
+            return cfg_path.parent.resolve()
     return None
 
 
@@ -267,6 +294,7 @@ def _ensure_peft_adapter_weights(
         return adapter_dir
 
     repo_id, subfolder = _split_hub_model_id(adapter_model_id)
+    subfolder = _peft_hub_subfolder_for_adapter(adapter_model_id, adapter_dir)
     if subfolder is None:
         raise FileNotFoundError(
             f"PEFT adapter weights missing under {adapter_dir}; "
@@ -363,8 +391,9 @@ def _load_processor(
     cache_dir: str,
     token: str | None,
     trust_remote_code: bool,
+    extra_model_ids: tuple[str, ...] = (),
 ) -> Any | None:
-    for mid in (model_id,):
+    for mid in (model_id, *extra_model_ids):
         try:
             return AutoProcessor.from_pretrained(
                 mid,
@@ -496,11 +525,15 @@ def load_hf_vlm_peft_adapter(
     )
     model_type = str(getattr(config, "model_type", "") or "")
 
+    processor_roots = [str(adapter_dir)]
+    if adapter_dir.name == "qwen_lora":
+        processor_roots.append(str(adapter_dir.parent))
     processor = _load_processor(
-        str(adapter_dir),
+        processor_roots[0],
         cache_dir=cache,
         token=token,
         trust_remote_code=trust_remote_code,
+        extra_model_ids=tuple(processor_roots[1:]),
     )
     if processor is None:
         processor = _load_processor(
@@ -621,6 +654,16 @@ def load_hf_vlm(
             device=device,
             cache_dir=cache_dir,
             trust_remote_code=trust_remote_code,
+        )
+
+    _, hub_subfolder = _split_hub_model_id(model_id)
+    if hub_subfolder is not None and not Path(model_id).expanduser().is_dir():
+        raise FileNotFoundError(
+            f"PEFT adapter not found for {model_id!r} (expected adapter_config.json). "
+            "Standard LoRA checkpoints use the bundle root "
+            "(e.g. .../qwen3vl-4b-surgsigma-lora-ft-v1). "
+            "Dense-vision LoRA checkpoints also work with the bundle root; "
+            "the loader auto-detects qwen_lora/."
         )
 
     _ensure_internvl_deps(model_id)
